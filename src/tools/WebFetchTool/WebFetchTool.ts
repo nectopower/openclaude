@@ -21,6 +21,18 @@ import {
   MAX_MARKDOWN_LENGTH,
 } from './utils.js'
 
+function isFirecrawlEnabled(): boolean {
+  return Boolean(process.env.FIRECRAWL_API_KEY)
+}
+
+async function scrapeWithFirecrawl(url: string): Promise<{ markdown: string; bytes: number }> {
+  const { FirecrawlClient } = await import('@mendable/firecrawl-js')
+  const app = new FirecrawlClient({ apiKey: process.env.FIRECRAWL_API_KEY! })
+  const result = await app.scrape(url, { formats: ['markdown'] })
+  const markdown = (result as { markdown?: string }).markdown ?? ''
+  return { markdown, bytes: Buffer.byteLength(markdown) }
+}
+
 const inputSchema = lazySchema(() =>
   z.strictObject({
     url: z.string().url().describe('The URL to fetch content from'),
@@ -210,6 +222,27 @@ ${DESCRIPTION}`
     { abortController, options: { isNonInteractiveSession } },
   ) {
     const start = Date.now()
+
+    if (isFirecrawlEnabled()) {
+      const { markdown, bytes } = await scrapeWithFirecrawl(url)
+      const result = await applyPromptToMarkdown(
+        prompt,
+        markdown,
+        abortController.signal,
+        isNonInteractiveSession,
+        false,
+      )
+      return {
+        data: {
+          bytes,
+          code: 200,
+          codeText: 'OK',
+          result,
+          durationMs: Date.now() - start,
+          url,
+        } satisfies Output,
+      }
+    }
 
     const response = await getURLMarkdownContent(url, abortController)
 
