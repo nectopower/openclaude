@@ -250,6 +250,13 @@
       justify-content: center;
       gap: 12px;
       color: var(--text-muted);
+      position: relative;
+    }
+
+    .empty-state .menu-btn {
+      position: absolute;
+      top: 16px;
+      left: 16px;
     }
 
     .empty-state .logo {
@@ -435,6 +442,17 @@
 <!-- Main -->
 <main class="main" id="main">
   <div class="empty-state" id="emptyState">
+    <button
+      class="menu-btn"
+      id="emptyStateMenuButton"
+      type="button"
+      aria-label="Toggle sessions drawer"
+      aria-expanded="false"
+      data-mobile-menu-button
+      onclick="toggleMobileSidebar()"
+    >
+      ☰
+    </button>
     <div class="logo">◆</div>
     <p>Select a session to start</p>
   </div>
@@ -447,6 +465,7 @@
         type="button"
         aria-label="Toggle sessions drawer"
         aria-expanded="false"
+        data-mobile-menu-button
         onclick="toggleMobileSidebar()"
       >
         ☰
@@ -506,9 +525,9 @@ function syncMobileSidebar() {
   const open = isMobileViewport() && isMobileSidebarOpen
   document.getElementById('sidebar').classList.toggle('open', open)
   document.getElementById('mobileSidebarBackdrop').classList.toggle('open', open)
-  document
-    .getElementById('mobileMenuButton')
-    .setAttribute('aria-expanded', String(open))
+  document.querySelectorAll('[data-mobile-menu-button]').forEach(button => {
+    button.setAttribute('aria-expanded', String(open))
+  })
 }
 
 function toggleMobileSidebar() {
