@@ -188,6 +188,7 @@ import { createRemoteSessionConfig } from './remote/RemoteSessionManager.js';
 // teleportWithProgress dynamically imported at call site
 import { createDirectConnectSession, DirectConnectError } from './server/createDirectConnectSession.js';
 import { initializeLspServerManager } from './services/lsp/manager.js';
+import { createHostMirrorRuntime } from './web/hostMirrorRuntime.js';
 import { shouldEnablePromptSuggestion } from './services/PromptSuggestion/promptSuggestion.js';
 import { type AppState, getDefaultAppState, IDLE_SPECULATION_STATE } from './state/AppStateStore.js';
 import { onChangeAppState } from './state/onChangeAppState.js';
@@ -2207,12 +2208,18 @@ async function run(): Promise<CommanderCommand> {
     let root!: Root;
     let getFpsMetrics!: () => FpsMetrics | undefined;
     let stats!: StatsStore;
+    let hostMirrorRuntime: ReturnType<typeof createHostMirrorRuntime> | undefined;
 
     // Show setup screens after commands are loaded
     if (!isNonInteractiveSession) {
       const ctx = getRenderContext(false);
       getFpsMetrics = ctx.getFpsMetrics;
       stats = ctx.stats;
+      hostMirrorRuntime = createHostMirrorRuntime({
+        stdin: ctx.renderOptions.stdin ?? process.stdin,
+        stdout: process.stdout,
+        stderr: process.stderr
+      });
       // Install asciicast recorder before Ink mounts (internal-only, opt-in via CLAUDE_CODE_TERMINAL_RECORDING=1)
       if ("external" === 'ant') {
         installAsciicastRecorder();
@@ -2220,7 +2227,10 @@ async function run(): Promise<CommanderCommand> {
       const {
         createRoot
       } = await import('./ink.js');
-      root = await createRoot(ctx.renderOptions);
+      root = await createRoot({
+        ...ctx.renderOptions,
+        ...hostMirrorRuntime.renderOptions
+      });
 
       // Log startup time now, before any blocking dialog renders. Logging
       // from REPL's first render (the old location) included however long
@@ -2481,6 +2491,7 @@ async function run(): Promise<CommanderCommand> {
       is_native_binary: isInBundledMode()
     });
     registerCleanup(async () => {
+      hostMirrorRuntime?.dispose();
       logForDiagnosticsNoPII('info', 'exited');
     });
     void logTenguInit({
