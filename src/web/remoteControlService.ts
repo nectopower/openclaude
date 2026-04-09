@@ -48,7 +48,7 @@ export function createRemoteControlService(options?: {
       try {
         if (input.source === 'worktree') {
           const worktree = await createAgentWorktree(
-            `remote-control-${sessions.size}`,
+            `remote-control-${id.slice(0, 8)}`,
           )
 
           session.cwd = worktree.worktreePath

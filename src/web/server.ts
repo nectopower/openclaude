@@ -461,18 +461,57 @@ export function createRemoteControlApiHandlers(
   }
 }
 
+type WsConnectMessage = {
+  type: 'connect'
+  token?: string
+  session_id?: string
+  cols?: number
+  rows?: number
+}
+
+type WsInputMessage = {
+  type: 'input'
+  data?: string
+}
+
+type WsResizeMessage = {
+  type: 'resize'
+  cols?: number
+  rows?: number
+}
+
+type WsClientMessage = WsConnectMessage | WsInputMessage | WsResizeMessage
+
+function parseWsMessage(raw: unknown): WsClientMessage | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(String(raw))
+  } catch {
+    return null
+  }
+
+  if (!parsed || typeof parsed !== 'object' || !('type' in parsed)) {
+    return null
+  }
+
+  const obj = parsed as Record<string, unknown>
+  if (obj.type !== 'connect' && obj.type !== 'input' && obj.type !== 'resize') {
+    return null
+  }
+
+  return obj as WsClientMessage
+}
+
 function handleWebSocket(ws: WebSocket): void {
   let sessionId: string | null = null
 
   ws.on('message', raw => {
-    let msg: any
-    try {
-      msg = JSON.parse(raw.toString())
-    } catch {
+    const msg = parseWsMessage(raw)
+    if (!msg) {
       return
     }
 
-    if (msg?.type === 'connect') {
+    if (msg.type === 'connect') {
       if (sessionId) {
         detachClient(sessionId, ws)
       }
@@ -522,7 +561,7 @@ function handleWebSocket(ws: WebSocket): void {
       return
     }
 
-    if (msg?.type === 'input') {
+    if (msg.type === 'input') {
       if (!sessionId) {
         return
       }
@@ -534,7 +573,7 @@ function handleWebSocket(ws: WebSocket): void {
       return
     }
 
-    if (msg?.type === 'resize') {
+    if (msg.type === 'resize') {
       if (!sessionId) {
         return
       }

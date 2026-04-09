@@ -651,7 +651,8 @@ function selectSession(id) {
   connectTerminal(session)
 
   if (isMobileViewport()) {
-    closeMobileSidebar()
+    // Delay drawer close so user sees the active highlight briefly
+    setTimeout(() => closeMobileSidebar(), 250)
   }
 }
 
