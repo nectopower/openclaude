@@ -8,7 +8,8 @@
  * - src/ path aliases
  */
 
-import { readFileSync } from 'fs'
+import { cpSync, readFileSync } from 'fs'
+import { resolve, dirname } from 'path'
 import { noTelemetryPlugin } from './no-telemetry-plugin'
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'))
@@ -21,7 +22,7 @@ const featureFlags: Record<string, boolean> = {
   VOICE_MODE: false,
   PROACTIVE: false,
   KAIROS: false,
-  BRIDGE_MODE: false,
+  BRIDGE_MODE: true,
   DAEMON: false,
   AGENT_TRIGGERS: false,
   MONITOR_TOOL: false,
@@ -352,6 +353,8 @@ ${exports}
     },
   ],
   external: [
+    // Native addon — cannot be bundled
+    'node-pty',
     // OpenTelemetry — too many named exports to stub, kept external
     '@opentelemetry/api',
     '@opentelemetry/api-logs',
@@ -391,5 +394,8 @@ if (!result.success) {
   }
   process.exit(1)
 }
+
+// Copy web static assets next to the bundle so the server can find them at runtime
+cpSync(resolve(__dirname, '..', 'src', 'web', 'static'), resolve(__dirname, '..', 'dist', 'web-static'), { recursive: true })
 
 console.log(`✓ Built openclaude v${version} → dist/cli.mjs`)

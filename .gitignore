@@ -10,3 +10,5 @@ GEMINI.md
 package-lock.json
 /.claude
 coverage/
+bin/cloudflared.exe
+/.worktrees/

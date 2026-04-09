@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenClaude</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
+  <style>
+    :root {
+      --bg: #1a1a1e;
+      --bg-dark: #131316;
+      --surface: #202024;
+      --border: #333338;
+      --text: #ececf1;
+      --text-secondary: #a1a1aa;
+      --text-muted: #71717a;
+      --accent: #c4956a;
+      --sidebar-w: 260px;
+      --radius: 8px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      height: 100dvh;
+      display: flex;
+      overflow: hidden;
+    }
+
+    .main,
+    #terminalPanel,
+    #terminal-container,
+    .topbar,
+    .statusbar {
+      min-width: 0;
+    }
+
+    .topbar .session-title,
+    .topbar .pill {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      width: var(--sidebar-w);
+      background: var(--bg-dark);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .sidebar-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .sidebar-header h2 {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    .sidebar-header h2::before {
+      content: '◆';
+      margin-right: 6px;
+      opacity: 0.8;
+    }
+
+    .sessions-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+
+    .session-item {
+      padding: 10px 12px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      margin-bottom: 4px;
+      border: 1px solid transparent;
+      transition: background 0.15s;
+    }
+
+    .session-item:hover {
+      background: var(--surface);
+    }
+
+    .session-item.active {
+      background: var(--surface);
+      border-color: var(--accent);
+    }
+
+    .session-item .label {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .session-item .cwd {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .session-item .status {
+      display: inline-block;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+
+    .session-item.active .status { background: #4ade80; }
+
+    .new-session-btn {
+      margin: 8px;
+      padding: 8px 12px;
+      background: transparent;
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+      color: var(--text-secondary);
+      font-size: 12px;
+      cursor: pointer;
+      text-align: left;
+      transition: border-color 0.15s, color 0.15s;
+    }
+
+    .new-session-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .menu-btn {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text);
+      font-size: 18px;
+      cursor: pointer;
+    }
+
+    .sidebar-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.45);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease;
+      z-index: 20;
+    }
+
+    .sidebar-backdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    @media (max-width: 768px) {
+      .menu-btn {
+        display: inline-flex;
+      }
+
+      .sidebar {
+        position: fixed;
+        inset: 0 auto 0 0;
+        width: min(82vw, 320px);
+        max-width: calc(100vw - 48px);
+        z-index: 30;
+        transform: translateX(-100%);
+        transition: transform 0.18s ease;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+      }
+
+      .sidebar.open {
+        transform: translateX(0);
+      }
+
+      .main {
+        width: 100%;
+      }
+
+      .topbar {
+        padding: 0 10px;
+        gap: 8px;
+      }
+
+      .topbar .close-btn {
+        padding: 4px 8px;
+      }
+
+      .session-item .cwd,
+      .topbar .session-title,
+      .topbar .pill {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      #terminal-container {
+        padding: 0;
+      }
+    }
+
+    /* ── Main terminal area ── */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      background: #0d0d0d;
+    }
+
+    .topbar {
+      height: 38px;
+      background: var(--bg-dark);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    .topbar .session-title {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .topbar .session-title strong {
+      color: var(--text);
+    }
+
+    .topbar .pill {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 100px;
+      background: var(--surface);
+      color: var(--text-muted);
+    }
+
+    .topbar .spacer { flex: 1; }
+
+    .topbar .close-btn {
+      padding: 4px 10px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-muted);
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    .topbar .close-btn:hover {
+      border-color: #f87171;
+      color: #f87171;
+    }
+
+    #terminal-container {
+      flex: 1;
+      min-height: 0;
+      padding: 8px;
+    }
+
+    #terminal-container .xterm {
+      height: 100%;
+    }
+
+    /* Empty state */
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--text-muted);
+      position: relative;
+    }
+
+    .empty-state .menu-btn {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+    }
+
+    .empty-state .logo {
+      font-size: 32px;
+      color: var(--accent);
+    }
+
+    .empty-state p {
+      font-size: 14px;
+    }
+
+    /* ── New Session Modal ── */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .modal-overlay.open { display: flex; }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      width: 480px;
+      max-width: 95vw;
+    }
+
+    .modal h3 {
+      font-size: 15px;
+      margin-bottom: 16px;
+    }
+
+    .modal label {
+      display: block;
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }
+
+    .modal input[type="text"] {
+      width: 100%;
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 13px;
+      padding: 8px 10px;
+      margin-bottom: 12px;
+    }
+
+    .modal input[type="text"]:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .dir-browser {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      height: 180px;
+      overflow-y: auto;
+      margin-bottom: 12px;
+    }
+
+    .dir-browser .dir-entry {
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .dir-browser .dir-entry:hover { background: var(--surface); }
+
+    .dir-browser .dir-entry.parent {
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .modal-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      margin-top: 4px;
+    }
+
+    .btn {
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      border: none;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn-primary:hover { opacity: 0.9; }
+
+    .btn-secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    .btn-secondary:hover { border-color: var(--text-secondary); }
+
+    /* Source toggle */
+    .source-toggle {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .source-toggle button {
+      flex: 1;
+      padding: 6px;
+      font-size: 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+    }
+
+    .source-toggle button.active {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    /* Status bar */
+    .statusbar {
+      height: 22px;
+      background: var(--bg-dark);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      gap: 16px;
+      font-size: 11px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+
+    .statusbar .conn-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #f87171;
+      display: inline-block;
+      margin-right: 4px;
+    }
+
+    .statusbar .conn-dot.ok { background: #4ade80; }
+  </style>
+</head>
+<body>
+
+<div
+  class="sidebar-backdrop"
+  id="mobileSidebarBackdrop"
+  onclick="closeMobileSidebar()"
+></div>
+
+<!-- Sidebar -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <h2>OpenClaude</h2>
+  </div>
+  <div class="sessions-list" id="sessionsList"></div>
+  <button class="new-session-btn" onclick="openNewSessionModal()">+ New session</button>
+</aside>
+
+<!-- Main -->
+<main class="main" id="main">
+  <div class="empty-state" id="emptyState">
+    <button
+      class="menu-btn"
+      id="emptyStateMenuButton"
+      type="button"
+      aria-label="Toggle sessions drawer"
+      aria-expanded="false"
+      data-mobile-menu-button
+      onclick="toggleMobileSidebar()"
+    >
+      ☰
+    </button>
+    <div class="logo">◆</div>
+    <p>Select a session to start</p>
+  </div>
+
+  <div id="terminalPanel" style="display:none;flex:1;flex-direction:column;min-height:0">
+    <div class="topbar">
+      <button
+        class="menu-btn"
+        id="mobileMenuButton"
+        type="button"
+        aria-label="Toggle sessions drawer"
+        aria-expanded="false"
+        data-mobile-menu-button
+        onclick="toggleMobileSidebar()"
+      >
+        ☰
+      </button>
+      <span class="session-title"><strong id="topbarLabel">—</strong></span>
+      <span class="pill" id="topbarCwd">—</span>
+      <div class="spacer"></div>
+      <button class="close-btn" onclick="closeCurrentSession()">Close session</button>
+    </div>
+    <div id="terminal-container"></div>
+    <div class="statusbar">
+      <span><span class="conn-dot" id="connDot"></span><span id="connStatus">Disconnected</span></span>
+    </div>
+  </div>
+</main>
+
+<!-- New Session Modal -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <h3>New Session</h3>
+    <label>Session label</label>
+    <input type="text" id="modalLabel" placeholder="My project" />
+    <label>Source</label>
+    <div class="source-toggle">
+      <button class="active" id="srcCwd" onclick="setSource('cwd')">Current directory</button>
+      <button id="srcWorktree" onclick="setSource('worktree')">New worktree</button>
+    </div>
+    <label>Directory</label>
+    <div class="dir-browser" id="dirBrowser"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="createSession()">Create</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script>
+// ─── State ────────────────────────────────────────────────────────────────────
+let sessions = []
+let activeSessionId = null
+let ws = null
+let term = null
+let fitAddon = null
+let modalSource = 'cwd'
+let currentBrowsePath = ''
+let resizeObserver = null
+let isMobileSidebarOpen = false
+const hostTokenFromPath = getHostTokenFromPath()
+
+function isMobileViewport() {
+  return window.matchMedia('(max-width: 768px)').matches
+}
+
+function syncMobileSidebar() {
+  const open = isMobileViewport() && isMobileSidebarOpen
+  document.getElementById('sidebar').classList.toggle('open', open)
+  document.getElementById('mobileSidebarBackdrop').classList.toggle('open', open)
+  document.querySelectorAll('[data-mobile-menu-button]').forEach(button => {
+    button.setAttribute('aria-expanded', String(open))
+  })
+}
+
+function toggleMobileSidebar() {
+  if (!isMobileViewport()) return
+  isMobileSidebarOpen = !isMobileSidebarOpen
+  syncMobileSidebar()
+}
+
+function closeMobileSidebar() {
+  isMobileSidebarOpen = false
+  syncMobileSidebar()
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+async function init() {
+  syncMobileSidebar()
+  await loadSessions()
+
+  if (hostTokenFromPath) {
+    const attached = await autoAttachHostSession(hostTokenFromPath)
+    if (attached) {
+      return
+    }
+
+    showEmptyState('This remote-control session is no longer available.')
+    return
+  }
+
+  if (sessions.length > 0) {
+    selectSession(sessions[0].id)
+  }
+}
+
+// ─── Sessions ─────────────────────────────────────────────────────────────────
+async function loadSessions() {
+  try {
+    const res = await fetch('/api/sessions')
+    const loadedSessions = await res.json()
+    sessions = Array.isArray(loadedSessions) ? loadedSessions : []
+    renderSessions()
+  } catch (e) {
+    console.error('Failed to load sessions', e)
+  }
+}
+
+function upsertSession(session) {
+  const index = sessions.findIndex(s => s.id === session.id)
+  if (index === -1) {
+    sessions.unshift(session)
+  } else {
+    sessions[index] = session
+  }
+  renderSessions()
+}
+
+function renderSessions() {
+  const list = document.getElementById('sessionsList')
+  list.innerHTML = ''
+  for (const s of sessions) {
+    const div = document.createElement('div')
+    div.className = 'session-item' + (s.id === activeSessionId ? ' active' : '')
+    div.onclick = () => selectSession(s.id)
+    div.innerHTML = `
+      <div class="label"><span class="status"></span>${escHtml(s.label)}</div>
+      <div class="cwd">${escHtml(s.cwd)}</div>
+    `
+    list.appendChild(div)
+  }
+}
+
+function selectSession(id) {
+  const session = sessions.find(s => s.id === id)
+  if (!session) return
+
+  activeSessionId = id
+  renderSessions()
+  showSessionPanel(session)
+  connectTerminal(session)
+
+  if (isMobileViewport()) {
+    closeMobileSidebar()
+  }
+}
+
+async function autoAttachHostSession(token) {
+  try {
+    const res = await fetch(`/api/host-session?token=${encodeURIComponent(token)}`)
+    if (!res.ok) {
+      return false
+    }
+
+    const session = await res.json()
+    upsertSession(session)
+    selectSession(session.id)
+    return true
+  } catch (e) {
+    console.error('Failed to resolve host session', e)
+    return false
+  }
+}
+
+function showSessionPanel(session) {
+  document.getElementById('emptyState').style.display = 'none'
+  const panel = document.getElementById('terminalPanel')
+  panel.style.display = 'flex'
+  panel.style.flexDirection = 'column'
+
+  document.getElementById('topbarLabel').textContent = session.label
+  document.getElementById('topbarCwd').textContent = session.cwd
+}
+
+function showEmptyState(message) {
+  closeMobileSidebar()
+
+  if (ws) {
+    ws.close()
+    ws = null
+  }
+  if (term) {
+    term.dispose()
+    term = null
+    fitAddon = null
+  }
+  if (resizeObserver) {
+    resizeObserver.disconnect()
+    resizeObserver = null
+  }
+
+  activeSessionId = null
+  renderSessions()
+  document.getElementById('terminalPanel').style.display = 'none'
+  document.getElementById('emptyState').style.display = 'flex'
+  document.querySelector('#emptyState p').textContent = message
+  setConnStatus(false)
+}
+
+// ─── Terminal ─────────────────────────────────────────────────────────────────
+function connectTerminal(session) {
+  if (term) {
+    term.dispose()
+    term = null
+    fitAddon = null
+  }
+  if (ws) {
+    ws.close()
+    ws = null
+  }
+  if (resizeObserver) {
+    resizeObserver.disconnect()
+    resizeObserver = null
+  }
+
+  const container = document.getElementById('terminal-container')
+  container.innerHTML = ''
+
+  term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", monospace',
+    theme: {
+      background: '#0d0d0d',
+      foreground: '#ececf1',
+      cursor: '#c4956a',
+      selectionBackground: 'rgba(196,149,106,0.3)',
+    },
+    allowProposedApi: true,
+  })
+
+  fitAddon = new FitAddon.FitAddon()
+  term.loadAddon(fitAddon)
+  term.open(container)
+
+  setTimeout(() => {
+    try { fitAddon.fit() } catch {}
+  }, 50)
+
+  resizeObserver = new ResizeObserver(() => {
+    try { fitAddon.fit() } catch {}
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
+    }
+  })
+  resizeObserver.observe(container)
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  ws = new WebSocket(`${proto}://${location.host}`)
+  setConnStatus(false)
+
+  ws.onopen = () => {
+    const connectMessage = {
+      type: 'connect',
+      cols: term.cols,
+      rows: term.rows,
+    }
+
+    if (session.kind === 'host' && session.token) {
+      connectMessage.token = session.token
+    } else {
+      connectMessage.session_id = session.id
+    }
+
+    ws.send(JSON.stringify(connectMessage))
+  }
+
+  ws.onmessage = (event) => {
+    let msg
+    try { msg = JSON.parse(event.data) } catch { return }
+
+    if (msg.type === 'connected') {
+      setConnStatus(true)
+      if (term) term.focus()
+    }
+
+    if (msg.type === 'output' && term) {
+      term.write(msg.data)
+    }
+
+    if (msg.type === 'exit') {
+      setConnStatus(false)
+      if (term) term.write(`\r\n[Process exited with code ${msg.code}]\r\n`)
+    }
+
+    if (msg.type === 'error') {
+      setConnStatus(false)
+      if (term) {
+        term.write(`\r\n\x1b[31m[Error: ${msg.message}]\x1b[0m\r\n`)
+      } else if (session.kind === 'host') {
+        showEmptyState(msg.message)
+      }
+    }
+  }
+
+  ws.onclose = () => setConnStatus(false)
+  ws.onerror = () => setConnStatus(false)
+
+  term.onData(data => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'input', data }))
+    }
+  })
+
+  term.onBinary(data => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'input', data }))
+    }
+  })
+}
+
+function setConnStatus(ok) {
+  const dot = document.getElementById('connDot')
+  const label = document.getElementById('connStatus')
+  if (ok) {
+    dot.className = 'conn-dot ok'
+    label.textContent = 'Connected'
+  } else {
+    dot.className = 'conn-dot'
+    label.textContent = 'Disconnected'
+  }
+}
+
+// ─── Close session ────────────────────────────────────────────────────────────
+async function closeCurrentSession() {
+  if (!activeSessionId) return
+
+  const session = sessions.find(s => s.id === activeSessionId)
+  if (session && session.kind !== 'host') {
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(activeSessionId)}/close`, { method: 'POST' })
+    } catch {}
+  }
+
+  showEmptyState('Select a session to start')
+  await loadSessions()
+}
+
+// ─── New Session Modal ─────────────────────────────────────────────────────────
+function openNewSessionModal() {
+  closeMobileSidebar()
+  modalSource = 'cwd'
+  document.getElementById('srcCwd').classList.add('active')
+  document.getElementById('srcWorktree').classList.remove('active')
+  document.getElementById('modalLabel').value = ''
+  document.getElementById('modalOverlay').classList.add('open')
+  browseTo('')
+}
+
+function closeModal() {
+  document.getElementById('modalOverlay').classList.remove('open')
+}
+
+function setSource(src) {
+  modalSource = src
+  document.getElementById('srcCwd').classList.toggle('active', src === 'cwd')
+  document.getElementById('srcWorktree').classList.toggle('active', src === 'worktree')
+}
+
+async function browseTo(dir) {
+  currentBrowsePath = dir
+  const res = await fetch(`/api/browse?path=${encodeURIComponent(dir)}`)
+  const data = await res.json()
+
+  const browser = document.getElementById('dirBrowser')
+  browser.innerHTML = ''
+
+  if (!document.getElementById('modalLabel').value) {
+    document.getElementById('modalLabel').value = data.path.split(data.sep).pop() || data.path
+  }
+
+  if (data.parent && data.parent !== data.path) {
+    const el = document.createElement('div')
+    el.className = 'dir-entry parent'
+    el.textContent = '.. ' + data.parent
+    el.onclick = () => browseTo(data.parent)
+    browser.appendChild(el)
+  }
+
+  if (data.drives && data.drives.length > 0) {
+    for (const drive of data.drives) {
+      const el = document.createElement('div')
+      el.className = 'dir-entry'
+      el.textContent = '💾 ' + drive
+      el.onclick = () => browseTo(drive)
+      browser.appendChild(el)
+    }
+  }
+
+  for (const d of data.dirs) {
+    const el = document.createElement('div')
+    el.className = 'dir-entry'
+    el.textContent = '📁 ' + d
+    el.onclick = () => browseTo(data.path + data.sep + d)
+    browser.appendChild(el)
+  }
+
+  const pathEl = document.createElement('div')
+  pathEl.style.cssText = 'padding:6px 12px;font-size:11px;color:#4ade80;border-top:1px solid #333;'
+  pathEl.textContent = '✓ ' + data.path
+  browser.appendChild(pathEl)
+}
+
+async function createSession() {
+  const label = document.getElementById('modalLabel').value.trim() || 'Session'
+  const body = {
+    label,
+    source: modalSource,
+    cwd: currentBrowsePath || undefined,
+  }
+
+  try {
+    const res = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const session = await res.json()
+    if (session.error) { alert(session.error); return }
+    sessions.push(session)
+    renderSessions()
+    closeModal()
+    selectSession(session.id)
+  } catch (e) {
+    alert('Failed to create session: ' + e.message)
+  }
+}
+
+// ─── Utils ─────────────────────────────────────────────────────────────────────
+function getHostTokenFromPath() {
+  const path = location.pathname.replace(/^\/+|\/+$/g, '')
+  if (!path || path === 'index.html') {
+    return null
+  }
+
+  const segments = path.split('/')
+  return segments.length === 1 ? decodeURIComponent(segments[0]) : null
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+document.getElementById('modalOverlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal()
+})
+
+window.addEventListener('resize', syncMobileSidebar)
+
+init()
+</script>
+</body>
+</html>

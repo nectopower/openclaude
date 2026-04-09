@@ -3,10 +3,7 @@ import {
   applyProfileEnvToProcessEnv,
   buildStartupEnvFromProfile,
 } from '../utils/providerProfile.js'
-import {
-  getProviderValidationError,
-  validateProviderEnvOrExit,
-} from '../utils/providerValidation.js'
+import { getProviderValidationError } from '../utils/providerValidation.js'
 
 // OpenClaude: polyfill globalThis.File for Node < 20.
 // undici v7 references `File` at module evaluation time (webidl type
@@ -121,7 +118,13 @@ async function main(): Promise<void> {
     }
   }
 
-  await validateProviderEnvOrExit()
+  const interactiveStartupProviderError = await getProviderValidationError(
+    process.env,
+    { allowInteractiveRecovery: true },
+  )
+  if (interactiveStartupProviderError) {
+    console.error(`Warning: ${interactiveStartupProviderError}`)
+  }
 
   // Print the gradient startup screen before the Ink UI loads
   const { printStartupScreen } = await import('../components/StartupScreen.js')

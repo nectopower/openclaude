@@ -77,6 +77,12 @@ export type ProjectConfig = {
   allowedTools: string[]
   mcpContextUris: string[]
   mcpServers?: Record<string, McpServerConfig>
+  remoteControlLocalState?: {
+    pid: number
+    port: number
+    localUrl: string
+    publicUrl: string | null
+  }
   lastAPIDuration?: number
   lastAPIDurationWithoutRetries?: number
   lastToolDuration?: number
