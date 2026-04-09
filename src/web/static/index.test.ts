@@ -25,3 +25,14 @@ test('remote control mobile layout exposes drawer controls', () => {
   expect(html).toContain("window.addEventListener('resize', syncMobileSidebar)")
   expect(html).toMatch(/async function init\(\) \{[\s\S]*syncMobileSidebar\(\)/)
 })
+
+test('remote control mobile interactions close the drawer around session actions', () => {
+  const html = readIndexHtml()
+
+  expect(html).toMatch(
+    /function selectSession\(id\) \{[\s\S]*if \(isMobileViewport\(\)\) \{[\s\S]*closeMobileSidebar\(\)/,
+  )
+  expect(html).toMatch(
+    /function openNewSessionModal\(\) \{[\s\S]*closeMobileSidebar\(\)/,
+  )
+})

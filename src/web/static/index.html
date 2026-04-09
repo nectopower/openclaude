@@ -606,6 +606,10 @@ function selectSession(id) {
   renderSessions()
   showSessionPanel(session)
   connectTerminal(session)
+
+  if (isMobileViewport()) {
+    closeMobileSidebar()
+  }
 }
 
 async function autoAttachHostSession(token) {
@@ -636,6 +640,8 @@ function showSessionPanel(session) {
 }
 
 function showEmptyState(message) {
+  closeMobileSidebar()
+
   if (ws) {
     ws.close()
     ws = null
@@ -799,6 +805,7 @@ async function closeCurrentSession() {
 
 // ─── New Session Modal ─────────────────────────────────────────────────────────
 function openNewSessionModal() {
+  closeMobileSidebar()
   modalSource = 'cwd'
   document.getElementById('srcCwd').classList.add('active')
   document.getElementById('srcWorktree').classList.remove('active')
