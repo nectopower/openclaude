@@ -39,3 +39,18 @@ test('remote control mobile interactions close the drawer around session actions
     /function showEmptyState\(message\) \{[\s\S]*closeMobileSidebar\(\)/,
   )
 })
+
+test('remote control mobile CSS keeps the terminal readable and prevents horizontal layout breakage', () => {
+  const html = readIndexHtml()
+
+  expect(html).toContain('height: 100dvh;')
+  expect(html).toContain('.main,')
+  expect(html).toContain('#terminalPanel,')
+  expect(html).toContain('#terminal-container,')
+  expect(html).toContain('min-width: 0;')
+  expect(html).toContain('.topbar .session-title,')
+  expect(html).toContain('.topbar .pill {')
+  expect(html).toContain('text-overflow: ellipsis;')
+  expect(html).toContain('#terminal-container {')
+  expect(html).toContain('padding: 0;')
+})
