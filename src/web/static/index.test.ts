@@ -35,4 +35,7 @@ test('remote control mobile interactions close the drawer around session actions
   expect(html).toMatch(
     /function openNewSessionModal\(\) \{[\s\S]*closeMobileSidebar\(\)/,
   )
+  expect(html).toMatch(
+    /function showEmptyState\(message\) \{[\s\S]*closeMobileSidebar\(\)/,
+  )
 })
