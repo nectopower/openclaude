@@ -53,6 +53,10 @@ async function importServer() {
   return import(`./server.ts?ts=${Date.now()}-${Math.random()}`)
 }
 
+beforeEach(() => {
+  clearHostSession()
+})
+
 afterEach(() => {
   clearHostSession()
   mock.restore()

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, test } from 'bun:test'
 
 import {
   clearHostSession,
@@ -7,6 +7,10 @@ import {
   registerHostSession,
   resolveHostSessionByToken,
 } from './hostSessionRegistry.ts'
+
+beforeEach(() => {
+  clearHostSession()
+})
 
 afterEach(() => {
   clearHostSession()
