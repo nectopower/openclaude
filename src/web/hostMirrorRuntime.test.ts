@@ -1,4 +1,4 @@
-import { afterEach, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
 import { PassThrough } from 'node:stream'
 
 import {
@@ -30,6 +30,10 @@ function createOutputStream(): NodeJS.WriteStream {
   stream.getColorDepth = () => 24
   return stream
 }
+
+beforeEach(() => {
+  clearHostSession()
+})
 
 afterEach(() => {
   clearHostSession()

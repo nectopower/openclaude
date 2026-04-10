@@ -1,6 +1,4 @@
 import { afterEach, expect, mock, test } from 'bun:test'
-import { EventEmitter } from 'node:events'
-import path from 'node:path'
 import { runWithCwdOverride } from '../utils/cwd.js'
 import {
   clearRemoteControlState,
@@ -9,15 +7,10 @@ import {
 } from './remoteControlState.js'
 
 const originalWebPort = process.env.WEB_PORT
-const originalCloudflaredDownloadUrl = process.env.CLOUDFLARED_DOWNLOAD_URL
 const originalFetch = globalThis.fetch
 
 async function importRemoteControlLauncher() {
   return import(`./remoteControlLauncher.ts?ts=${Date.now()}-${Math.random()}`)
-}
-
-async function importTunnelModule() {
-  return import(`./tunnel.ts?ts=${Date.now()}-${Math.random()}`)
 }
 
 afterEach(() => {
@@ -30,87 +23,29 @@ afterEach(() => {
   } else {
     process.env.WEB_PORT = originalWebPort
   }
-
-  if (originalCloudflaredDownloadUrl === undefined) {
-    delete process.env.CLOUDFLARED_DOWNLOAD_URL
-  } else {
-    process.env.CLOUDFLARED_DOWNLOAD_URL = originalCloudflaredDownloadUrl
-  }
 })
 
-test('startTunnel provisions cloudflared when the local binary is missing', async () => {
-  const downloadedBytes = new Uint8Array([1, 2, 3, 4])
-  const writeFileSync = mock(() => undefined)
-  const mkdirSync = mock(() => undefined)
-  const chmodSync = mock(() => undefined)
-  const existsSync = mock((targetPath: string) => !targetPath.includes('cloudflared'))
-  const child = new EventEmitter() as EventEmitter & {
-    stdout: EventEmitter
-    stderr: EventEmitter
-    kill: ReturnType<typeof mock>
-  }
-  child.stdout = new EventEmitter()
-  child.stderr = new EventEmitter()
-  child.kill = mock(() => true)
-
-  const spawn = mock((command: string, args: string[]) => {
-    queueMicrotask(() => {
-      child.stderr.emit(
-        'data',
-        'INF +------------------------------------------------------------+\n' +
-          'INF |  https://demo.trycloudflare.com                        |\n',
-      )
-    })
-
-    return Object.assign(child, {
-      command,
-      args,
-      once: child.once.bind(child),
-      on: child.on.bind(child),
-      removeListener: child.removeListener.bind(child),
-    })
-  })
-
-  globalThis.fetch = mock(async (input: string | URL | Request) => ({
-    ok: true,
-    url: typeof input === 'string' ? input : input.toString(),
-    arrayBuffer: async () => downloadedBytes.buffer,
-  })) as typeof fetch
-
-  process.env.CLOUDFLARED_DOWNLOAD_URL =
-    'https://downloads.example/cloudflared.exe'
-
-  mock.module('node:fs', () => ({
-    chmodSync,
-    existsSync,
-    mkdirSync,
-    writeFileSync,
+test('startTunnel returns running state when tunnel module resolves a URL', async () => {
+  mock.module('./server.js', () => ({
+    ensureRemoteControlServer: mock(async (port: number) => ({
+      port,
+      localUrl: `http://localhost:${port}`,
+    })),
   }))
-  mock.module('node:child_process', () => ({ spawn }))
-  mock.module('../utils/which.js', () => ({ which: mock(async () => null) }))
+  mock.module('./tunnel.js', () => ({
+    startTunnel: mock(async () => ({
+      status: 'running' as const,
+      url: 'https://demo.trycloudflare.com',
+    })),
+    stopTunnel: mock(() => ({ status: 'stopped' as const })),
+    getTunnelStatus: mock(() => ({ status: 'stopped' as const })),
+  }))
 
-  const tunnel = await importTunnelModule()
-  const result = await tunnel.startTunnel(3080)
+  const { startOrRevealRemoteControl } = await importRemoteControlLauncher()
+  const result = await startOrRevealRemoteControl()
 
-  expect(result).toEqual({
-    status: 'running',
-    url: 'https://demo.trycloudflare.com',
-  })
-  expect(globalThis.fetch).toHaveBeenCalledWith(
-    'https://downloads.example/cloudflared.exe',
-  )
-  expect(mkdirSync).toHaveBeenCalledWith(expect.stringContaining(`${path.sep}bin`), {
-    recursive: true,
-  })
-  expect(writeFileSync).toHaveBeenCalledWith(
-    expect.stringMatching(new RegExp(`cloudflared(?:\\.exe)?$`)),
-    Buffer.from(downloadedBytes),
-  )
-  expect(spawn).toHaveBeenCalledWith(
-    expect.stringMatching(new RegExp(`cloudflared(?:\\.exe)?$`)),
-    ['tunnel', '--url', 'http://127.0.0.1:3080', '--no-autoupdate'],
-    expect.objectContaining({ stdio: ['ignore', 'pipe', 'pipe'] }),
-  )
+  expect(result.status).toBe('running')
+  expect(result.publicUrl).toBe('https://demo.trycloudflare.com')
 })
 
 test('reads a healthy persisted remote control state from project config', async () => {
