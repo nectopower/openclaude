@@ -58,19 +58,40 @@ export async function startOrRevealRemoteControl(): Promise<RemoteControlStartup
 
   if (persistedState) {
     if (await isHealthyRemoteControlState(persistedState.localUrl)) {
+      const tunnelResult = await startTunnel(persistedState.port)
+      const publicUrl =
+        tunnelResult.status === 'running'
+          ? tunnelResult.url ?? persistedState.publicUrl
+          : persistedState.publicUrl
       const hostSession = getCurrentHostSession()
+      const resolvedHostSession = hostSession &&
+        hostSession.cwd === defaultCwd &&
+        hostSession.localUrl === persistedState.localUrl &&
+        hostSession.publicUrl === publicUrl
+        ? hostSession
+        : registerHostSession({
+            cwd: defaultCwd,
+            localUrl: persistedState.localUrl,
+            publicUrl,
+          })
+
+      writeRemoteControlState({
+        ...persistedState,
+        publicUrl,
+      })
+
       return {
         status: 'already-running',
         localUrl: persistedState.localUrl,
-        publicUrl: persistedState.publicUrl,
-        hostUrl: hostSession
-          ? buildHostUrl(persistedState.publicUrl, hostSession.token)
-          : null,
-        hostToken: hostSession?.token,
-        hostSessionId: hostSession?.id,
+        publicUrl,
+        hostUrl: buildHostUrl(publicUrl, resolvedHostSession.token),
+        hostToken: resolvedHostSession.token,
+        hostSessionId: resolvedHostSession.id,
         port: persistedState.port,
         defaultCwd,
         maxSessions: DEFAULT_REMOTE_CONTROL_MAX_SESSIONS,
+        message:
+          tunnelResult.status === 'error' ? tunnelResult.message : undefined,
       }
     }
 

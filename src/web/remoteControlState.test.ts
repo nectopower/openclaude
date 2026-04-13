@@ -69,6 +69,12 @@ test('returns already-running launcher details from persisted state', async () =
     publicUrl: null,
   })
 
+  const startTunnel = mock(async () => ({
+    status: 'error' as const,
+    message: 'tunnel unavailable',
+  }))
+
+  mock.module('./tunnel.js', () => ({ startTunnel }))
   mock.module('./hostSessionRegistry.js', () => ({
     getCurrentHostSession: mock(() => ({
       id: 'host-1',
@@ -106,7 +112,70 @@ test('returns already-running launcher details from persisted state', async () =
     port: 3080,
     defaultCwd: '/workspace/task-3',
     maxSessions: 3,
+    message: 'tunnel unavailable',
   })
+  expect(startTunnel.mock.calls).toEqual([[3080]])
+})
+
+test('already-running recreates host session and mirror URL when session cache is empty', async () => {
+  writeRemoteControlState({
+    pid: 4242,
+    port: 3080,
+    localUrl: 'http://localhost:3080',
+    publicUrl: null,
+  })
+
+  globalThis.fetch = mock(async () => ({ ok: true })) as typeof fetch
+
+  const startTunnel = mock(async () => ({
+    status: 'running' as const,
+    url: 'https://demo.trycloudflare.com',
+  }))
+  const registerHostSession = mock(() => ({
+    id: 'host-new',
+    kind: 'host' as const,
+    label: 'Live CLI',
+    cwd: '/workspace/task-7',
+    token: 'token-new',
+    localUrl: 'http://localhost:3080',
+    publicUrl: 'https://demo.trycloudflare.com',
+    createdAt: 1,
+    isAlive: true,
+  }))
+
+  mock.module('./tunnel.js', () => ({ startTunnel }))
+  mock.module('./hostSessionRegistry.js', () => ({
+    getCurrentHostSession: mock(() => null),
+    registerHostSession,
+    invalidateHostSession: mock(() => undefined),
+    clearHostSession: mock(() => undefined),
+    resolveHostSessionByToken: mock(() => null),
+  }))
+
+  const { startOrRevealRemoteControl } = await importRemoteControlLauncher()
+  const result = await runWithCwdOverride('/workspace/task-7', () =>
+    startOrRevealRemoteControl(),
+  )
+
+  expect(result).toEqual({
+    status: 'already-running',
+    localUrl: 'http://localhost:3080',
+    publicUrl: 'https://demo.trycloudflare.com',
+    hostUrl: 'https://demo.trycloudflare.com/token-new',
+    hostToken: 'token-new',
+    hostSessionId: 'host-new',
+    port: 3080,
+    defaultCwd: '/workspace/task-7',
+    maxSessions: 3,
+  })
+  expect(startTunnel.mock.calls).toEqual([[3080]])
+  expect(registerHostSession.mock.calls).toEqual([
+    [{
+      cwd: '/workspace/task-7',
+      localUrl: 'http://localhost:3080',
+      publicUrl: 'https://demo.trycloudflare.com',
+    }],
+  ])
 })
 
  test('returns a tokenized host URL for the live CLI after successful startup', async () => {
