@@ -82,7 +82,6 @@ export async function getProviderValidationError(
     resolveGeminiCredential?: (
       env: NodeJS.ProcessEnv,
     ) => Promise<GeminiResolvedCredential>
-    allowInteractiveRecovery?: boolean
   },
 ): Promise<string | null> {
   const secretSource = env
@@ -153,9 +152,6 @@ export async function getProviderValidationError(
   if (!env.OPENAI_API_KEY && !isLocalProviderUrl(request.baseUrl)) {
     const hasGithubToken = !!(env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim())
     if (useGithub && hasGithubToken) {
-      return null
-    }
-    if (options?.allowInteractiveRecovery) {
       return null
     }
     return getOpenAIMissingKeyMessage()
