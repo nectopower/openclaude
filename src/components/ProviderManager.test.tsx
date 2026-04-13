@@ -5,12 +5,14 @@ import React from 'react'
 import stripAnsi from 'strip-ansi'
 
 import { createRoot } from '../ink.js'
+import { KeybindingSetup } from '../keybindings/KeybindingProviderSetup.js'
 import { AppStateProvider } from '../state/AppState.js'
 
 const SYNC_START = '\x1B[?2026h'
 const SYNC_END = '\x1B[?2026l'
 
 const ORIGINAL_ENV = {
+  CLAUDE_CODE_SIMPLE: process.env.CLAUDE_CODE_SIMPLE,
   CLAUDE_CODE_USE_GITHUB: process.env.CLAUDE_CODE_USE_GITHUB,
   GITHUB_TOKEN: process.env.GITHUB_TOKEN,
   GH_TOKEN: process.env.GH_TOKEN,
@@ -106,41 +108,153 @@ function createDeferred<T>(): {
   return { promise, resolve }
 }
 
-function mockProviderProfilesModule(): void {
+function mockProviderProfilesModule(options?: {
+  addProviderProfile?: (...args: unknown[]) => unknown
+  getProviderProfiles?: () => unknown[]
+  updateProviderProfile?: (...args: unknown[]) => unknown
+  setActiveProviderProfile?: (...args: unknown[]) => unknown
+}): void {
   mock.module('../utils/providerProfiles.js', () => ({
-    addProviderProfile: () => null,
+    addProviderProfile: options?.addProviderProfile ?? (() => null),
     applyActiveProviderProfileFromConfig: () => {},
     deleteProviderProfile: () => ({ removed: false, activeProfileId: null }),
     getActiveProviderProfile: () => null,
-    getProviderPresetDefaults: () => ({
-      provider: 'openai',
-      name: 'Mock provider',
-      baseUrl: 'http://localhost:11434/v1',
-      model: 'mock-model',
-      apiKey: '',
-    }),
-    getProviderProfiles: () => [],
-    setActiveProviderProfile: () => null,
-    updateProviderProfile: () => null,
+    getProviderPresetDefaults: (preset: string) =>
+      preset === 'ollama'
+        ? {
+            provider: 'openai',
+            name: 'Ollama',
+            baseUrl: 'http://localhost:11434/v1',
+            model: 'llama3.1:8b',
+            apiKey: '',
+          }
+        : {
+            provider: 'openai',
+            name: 'Mock provider',
+            baseUrl: 'http://localhost:11434/v1',
+            model: 'mock-model',
+            apiKey: '',
+          },
+    getProviderProfiles: options?.getProviderProfiles ?? (() => []),
+    setActiveProviderProfile: options?.setActiveProviderProfile ?? (() => null),
+    updateProviderProfile: options?.updateProviderProfile ?? (() => null),
   }))
 }
 
 function mockProviderManagerDependencies(
-  syncRead: () => string | undefined,
-  asyncRead: () => Promise<string | undefined>,
+  githubSyncRead: () => string | undefined,
+  githubAsyncRead: () => Promise<string | undefined>,
+  options?: {
+    addProviderProfile?: (...args: unknown[]) => unknown
+    applySavedProfileToCurrentSession?: (...args: unknown[]) => Promise<string | null>
+    clearCodexCredentials?: () => { success: boolean; warning?: string }
+    getProviderProfiles?: () => unknown[]
+    hasLocalOllama?: () => Promise<boolean>
+    listOllamaModels?: () => Promise<
+      Array<{
+        name: string
+        sizeBytes?: number | null
+        family?: string | null
+        families?: string[]
+        parameterSize?: string | null
+        quantizationLevel?: string | null
+      }>
+    >
+    codexSyncRead?: () => unknown
+    codexAsyncRead?: () => Promise<unknown>
+    updateProviderProfile?: (...args: unknown[]) => unknown
+    setActiveProviderProfile?: (...args: unknown[]) => unknown
+    useCodexOAuthFlow?: (options: {
+      onAuthenticated: (tokens: {
+        accessToken: string
+        refreshToken: string
+        accountId?: string
+        idToken?: string
+        apiKey?: string
+      }, persistCredentials: (options?: { profileId?: string }) => void) =>
+        void | Promise<void>
+    }) => {
+      state: 'starting' | 'waiting' | 'error'
+      authUrl?: string
+      browserOpened?: boolean | null
+      message?: string
+    }
+  },
 ): void {
-  mockProviderProfilesModule()
+  mockProviderProfilesModule({
+    addProviderProfile: options?.addProviderProfile,
+    getProviderProfiles: options?.getProviderProfiles,
+    updateProviderProfile: options?.updateProviderProfile,
+    setActiveProviderProfile: options?.setActiveProviderProfile,
+  })
+
+  mock.module('../utils/providerDiscovery.js', () => ({
+    hasLocalOllama: options?.hasLocalOllama ?? (async () => false),
+    listOllamaModels: options?.listOllamaModels ?? (async () => []),
+  }))
 
   mock.module('../utils/githubModelsCredentials.js', () => ({
     clearGithubModelsToken: () => ({ success: true }),
     GITHUB_MODELS_HYDRATED_ENV_MARKER: 'CLAUDE_CODE_GITHUB_TOKEN_HYDRATED',
     hydrateGithubModelsTokenFromSecureStorage: () => {},
-    readGithubModelsToken: syncRead,
-    readGithubModelsTokenAsync: asyncRead,
+    readGithubModelsToken: githubSyncRead,
+    readGithubModelsTokenAsync: githubAsyncRead,
+  }))
+
+  mock.module('../utils/codexCredentials.js', () => ({
+    attachCodexProfileIdToStoredCredentials: () => ({ success: true }),
+    clearCodexCredentials:
+      options?.clearCodexCredentials ?? (() => ({ success: true })),
+    readCodexCredentials:
+      options?.codexSyncRead ?? (() => undefined),
+    readCodexCredentialsAsync:
+      options?.codexAsyncRead ?? (async () => undefined),
+  }))
+
+  mock.module('../utils/providerProfile.js', () => ({
+    applySavedProfileToCurrentSession:
+      options?.applySavedProfileToCurrentSession ?? (async () => null),
+    buildCodexOAuthProfileEnv: (tokens: {
+      accessToken: string
+      accountId?: string
+      idToken?: string
+    }) => {
+      const accountId =
+        tokens.accountId ??
+        (tokens.idToken ? 'acct_from_id_token' : undefined) ??
+        (tokens.accessToken ? 'acct_from_access_token' : undefined)
+
+      if (!accountId) {
+        return null
+      }
+
+      return {
+        OPENAI_BASE_URL: 'https://chatgpt.com/backend-api/codex',
+        OPENAI_MODEL: 'codexplan',
+        CHATGPT_ACCOUNT_ID: accountId,
+        CODEX_CREDENTIAL_SOURCE: 'oauth' as const,
+      }
+    },
+    clearPersistedCodexOAuthProfile: () => null,
+    createProfileFile: (profile: string, env: Record<string, unknown>) => ({
+      profile,
+      env,
+      createdAt: '2026-04-10T00:00:00.000Z',
+    }),
   }))
 
   mock.module('../utils/settings/settings.js', () => ({
     updateSettingsForSource: () => ({ error: null }),
+  }))
+
+  mock.module('./useCodexOAuthFlow.js', () => ({
+    useCodexOAuthFlow:
+      options?.useCodexOAuthFlow ??
+      (() => ({
+        state: 'waiting' as const,
+        authUrl: 'https://chatgpt.com/codex',
+        browserOpened: true,
+      })),
   }))
 }
 
@@ -162,9 +276,14 @@ async function waitForFrameOutput(
 async function mountProviderManager(
   ProviderManager: React.ComponentType<{
     mode: 'first-run' | 'manage'
-    onDone: () => void
+    onDone: (result?: unknown) => void
   }>,
+  options?: {
+    mode?: 'first-run' | 'manage'
+    onDone?: (result?: unknown) => void
+  },
 ): Promise<{
+  stdin: PassThrough
   getOutput: () => string
   dispose: () => Promise<void>
 }> {
@@ -177,14 +296,17 @@ async function mountProviderManager(
 
   root.render(
     <AppStateProvider>
-      <ProviderManager
-        mode="manage"
-        onDone={() => {}}
-      />
+      <KeybindingSetup>
+        <ProviderManager
+          mode={options?.mode ?? 'manage'}
+          onDone={options?.onDone ?? (() => {})}
+        />
+      </KeybindingSetup>
     </AppStateProvider>,
   )
 
   return {
+    stdin,
     getOutput,
     dispose: async () => {
       root.unmount()
@@ -198,14 +320,17 @@ async function mountProviderManager(
 async function renderProviderManagerFrame(
   ProviderManager: React.ComponentType<{
     mode: 'first-run' | 'manage'
-    onDone: () => void
+    onDone: (result?: unknown) => void
   }>,
   options?: {
+    mode?: 'first-run' | 'manage'
     waitForOutput?: (output: string) => boolean
     timeoutMs?: number
   },
 ): Promise<string> {
-  const mounted = await mountProviderManager(ProviderManager)
+  const mounted = await mountProviderManager(ProviderManager, {
+    mode: options?.mode,
+  })
   const output = await waitForFrameOutput(
     mounted.getOutput,
     frame => {
@@ -302,4 +427,503 @@ test('ProviderManager avoids first-frame false negative while stored-token looku
 
   expect(syncRead).not.toHaveBeenCalled()
   expect(asyncRead).toHaveBeenCalled()
+})
+
+test('ProviderManager first-run Ollama preset auto-detects installed models', async () => {
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+
+  const onDone = mock(() => {})
+  const addProviderProfile = mock((payload: {
+    provider: string
+    name: string
+    baseUrl: string
+    model: string
+    apiKey?: string
+  }) => ({
+    id: 'provider_ollama',
+    provider: payload.provider,
+    name: payload.name,
+    baseUrl: payload.baseUrl,
+    model: payload.model,
+    apiKey: payload.apiKey,
+  }))
+
+  mockProviderManagerDependencies(
+    () => undefined,
+    async () => undefined,
+    {
+      addProviderProfile,
+      hasLocalOllama: async () => true,
+      listOllamaModels: async () => [
+        {
+          name: 'gemma4:31b-cloud',
+          family: 'gemma',
+          parameterSize: '31b',
+        },
+        {
+          name: 'kimi-k2.5:cloud',
+          family: 'kimi',
+          parameterSize: '2.5b',
+        },
+      ],
+    },
+  )
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const mounted = await mountProviderManager(ProviderManager, {
+    mode: 'first-run',
+    onDone,
+  })
+
+  await waitForFrameOutput(
+    mounted.getOutput,
+    frame => frame.includes('Set up provider') && frame.includes('Ollama'),
+  )
+
+  mounted.stdin.write('j')
+  await Bun.sleep(50)
+  mounted.stdin.write('\r')
+
+  const modelFrame = await waitForFrameOutput(
+    mounted.getOutput,
+    frame =>
+      frame.includes('Choose an Ollama model') &&
+      frame.includes('gemma4:31b-cloud') &&
+      frame.includes('kimi-k2.5:cloud'),
+  )
+
+  expect(modelFrame).toContain('Choose an Ollama model')
+  expect(modelFrame).toContain('gemma4:31b-cloud')
+
+  await Bun.sleep(25)
+  mounted.stdin.write('\r')
+
+  await waitForCondition(() => onDone.mock.calls.length > 0)
+
+  expect(addProviderProfile).toHaveBeenCalled()
+  expect(addProviderProfile.mock.calls[0]?.[0]).toMatchObject({
+    name: 'Ollama',
+    baseUrl: 'http://localhost:11434/v1',
+    model: 'gemma4:31b-cloud',
+  })
+  expect(onDone).toHaveBeenCalledWith(
+    expect.objectContaining({
+      action: 'saved',
+      message: 'Provider configured: Ollama',
+    }),
+  )
+
+  await mounted.dispose()
+})
+
+test('ProviderManager first-run Codex OAuth switches the current session after login completes', async () => {
+  delete process.env.CLAUDE_CODE_SIMPLE
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+
+  const onDone = mock(() => {})
+  const applySavedProfileToCurrentSession = mock(async () => null)
+  const persistCredentials = mock(() => {})
+  const addProviderProfile = mock((payload: {
+    provider: string
+    name: string
+    baseUrl: string
+    model: string
+    apiKey?: string
+  }) => ({
+    id: 'provider_codex_oauth',
+    provider: payload.provider,
+    name: payload.name,
+    baseUrl: payload.baseUrl,
+    model: payload.model,
+    apiKey: payload.apiKey,
+  }))
+
+  mockProviderManagerDependencies(
+    () => undefined,
+    async () => undefined,
+    {
+      addProviderProfile,
+      applySavedProfileToCurrentSession,
+      useCodexOAuthFlow: ({ onAuthenticated }) => {
+        React.useEffect(() => {
+          void onAuthenticated({
+            accessToken: 'oauth-access-token',
+            refreshToken: 'oauth-refresh-token',
+            accountId: 'acct_oauth',
+          }, persistCredentials)
+        }, [onAuthenticated])
+
+        return {
+          state: 'waiting',
+          authUrl: 'https://chatgpt.com/codex',
+          browserOpened: true,
+        }
+      },
+    },
+  )
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const mounted = await mountProviderManager(ProviderManager, {
+    mode: 'first-run',
+    onDone,
+  })
+
+  await waitForFrameOutput(
+    mounted.getOutput,
+    frame => frame.includes('Set up provider') && frame.includes('Codex OAuth'),
+  )
+
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('\r')
+
+  await waitForCondition(() => onDone.mock.calls.length > 0)
+
+  expect(addProviderProfile).toHaveBeenCalledWith(
+    expect.objectContaining({
+      provider: 'openai',
+      name: 'Codex OAuth',
+      baseUrl: 'https://chatgpt.com/backend-api/codex',
+      model: 'codexplan',
+      apiKey: '',
+    }),
+    expect.objectContaining({ makeActive: true }),
+  )
+  expect(applySavedProfileToCurrentSession).toHaveBeenCalled()
+  expect(persistCredentials).toHaveBeenCalledWith({
+    profileId: 'provider_codex_oauth',
+  })
+  expect(onDone).toHaveBeenCalledWith(
+    expect.objectContaining({
+      action: 'saved',
+      message:
+        'Codex OAuth configured. OpenClaude switched to it for this session.',
+    }),
+  )
+
+  await mounted.dispose()
+})
+
+test('ProviderManager first-run Codex OAuth reports next-startup fallback when session activation fails', async () => {
+  delete process.env.CLAUDE_CODE_SIMPLE
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+
+  const onDone = mock(() => {})
+  const applySavedProfileToCurrentSession = mock(
+    async () => 'validation failed',
+  )
+  const persistCredentials = mock(() => {})
+  const addProviderProfile = mock((payload: {
+    provider: string
+    name: string
+    baseUrl: string
+    model: string
+    apiKey?: string
+  }) => ({
+    id: 'provider_codex_oauth',
+    provider: payload.provider,
+    name: payload.name,
+    baseUrl: payload.baseUrl,
+    model: payload.model,
+    apiKey: payload.apiKey,
+  }))
+
+  mockProviderManagerDependencies(
+    () => undefined,
+    async () => undefined,
+    {
+      addProviderProfile,
+      applySavedProfileToCurrentSession,
+      useCodexOAuthFlow: ({ onAuthenticated }) => {
+        React.useEffect(() => {
+          void onAuthenticated({
+            accessToken: 'oauth-access-token',
+            refreshToken: 'oauth-refresh-token',
+            accountId: 'acct_oauth',
+          }, persistCredentials)
+        }, [onAuthenticated])
+
+        return {
+          state: 'waiting',
+          authUrl: 'https://chatgpt.com/codex',
+          browserOpened: true,
+        }
+      },
+    },
+  )
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const mounted = await mountProviderManager(ProviderManager, {
+    mode: 'first-run',
+    onDone,
+  })
+
+  await waitForFrameOutput(
+    mounted.getOutput,
+    frame => frame.includes('Set up provider') && frame.includes('Codex OAuth'),
+  )
+
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('\r')
+
+  await waitForCondition(() => onDone.mock.calls.length > 0)
+
+  expect(persistCredentials).toHaveBeenCalledWith({
+    profileId: 'provider_codex_oauth',
+  })
+  expect(onDone).toHaveBeenCalledWith(
+    expect.objectContaining({
+      action: 'saved',
+      message:
+        'Codex OAuth configured. Saved for next startup. Warning: validation failed.',
+    }),
+  )
+
+  await mounted.dispose()
+})
+
+test('ProviderManager does not hijack a manual Codex profile when OAuth credentials are not yet linked', async () => {
+  delete process.env.CLAUDE_CODE_SIMPLE
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+
+  const onDone = mock(() => {})
+  const manualProfile = {
+    id: 'provider_manual_codex',
+    provider: 'openai',
+    name: 'Codex OAuth',
+    baseUrl: 'https://chatgpt.com/backend-api/codex',
+    model: 'gpt-5.4',
+    apiKey: 'manual-key',
+  }
+  const addProviderProfile = mock((payload: {
+    provider: string
+    name: string
+    baseUrl: string
+    model: string
+    apiKey?: string
+  }) => ({
+    id: 'provider_codex_oauth',
+    provider: payload.provider,
+    name: payload.name,
+    baseUrl: payload.baseUrl,
+    model: payload.model,
+    apiKey: payload.apiKey,
+  }))
+  const updateProviderProfile = mock(() => manualProfile)
+  const persistCredentials = mock(() => {})
+
+  mockProviderManagerDependencies(
+    () => undefined,
+    async () => undefined,
+    {
+      addProviderProfile,
+      getProviderProfiles: () => [manualProfile],
+      updateProviderProfile,
+      useCodexOAuthFlow: ({ onAuthenticated }) => {
+        const hasAuthenticated = React.useRef(false)
+
+        React.useEffect(() => {
+          if (hasAuthenticated.current) {
+            return
+          }
+          hasAuthenticated.current = true
+          void onAuthenticated({
+            accessToken: 'oauth-access-token',
+            refreshToken: 'oauth-refresh-token',
+            accountId: 'acct_oauth',
+          }, persistCredentials)
+        }, [onAuthenticated])
+
+        return {
+          state: 'waiting',
+          authUrl: 'https://chatgpt.com/codex',
+          browserOpened: true,
+        }
+      },
+    },
+  )
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const mounted = await mountProviderManager(ProviderManager, {
+    mode: 'first-run',
+    onDone,
+  })
+
+  await waitForFrameOutput(
+    mounted.getOutput,
+    frame => frame.includes('Set up provider') && frame.includes('Codex OAuth'),
+  )
+
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('\r')
+
+  await waitForCondition(() => onDone.mock.calls.length > 0)
+
+  expect(addProviderProfile).toHaveBeenCalledTimes(1)
+  expect(updateProviderProfile).not.toHaveBeenCalled()
+  expect(persistCredentials).toHaveBeenCalledWith({
+    profileId: 'provider_codex_oauth',
+  })
+
+  await mounted.dispose()
+})
+
+test('ProviderManager keeps Codex OAuth as next-startup only when activating the session fails from the menu', async () => {
+  delete process.env.CLAUDE_CODE_SIMPLE
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+
+  const codexProfile = {
+    id: 'provider_codex_oauth',
+    provider: 'openai',
+    name: 'Codex OAuth',
+    baseUrl: 'https://chatgpt.com/backend-api/codex',
+    model: 'codexplan',
+    apiKey: '',
+  }
+
+  const applySavedProfileToCurrentSession = mock(
+    async () => 'validation failed',
+  )
+  const setActiveProviderProfile = mock(() => codexProfile)
+
+  mockProviderManagerDependencies(
+    () => undefined,
+    async () => undefined,
+    {
+      applySavedProfileToCurrentSession,
+      getProviderProfiles: () => [codexProfile],
+      setActiveProviderProfile,
+      codexAsyncRead: async () => ({
+        accessToken: 'oauth-access-token',
+        refreshToken: 'oauth-refresh-token',
+        accountId: 'acct_oauth',
+        profileId: 'provider_codex_oauth',
+      }),
+    },
+  )
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const mounted = await mountProviderManager(ProviderManager)
+
+  await waitForFrameOutput(
+    mounted.getOutput,
+    frame =>
+      frame.includes('Provider manager') &&
+      frame.includes('Set active provider') &&
+      frame.includes('Log out Codex OAuth'),
+  )
+
+  mounted.stdin.write('j')
+  await Bun.sleep(25)
+  mounted.stdin.write('\r')
+
+  await waitForFrameOutput(
+    mounted.getOutput,
+    frame => frame.includes('Set active provider') && frame.includes('Codex OAuth'),
+  )
+
+  await Bun.sleep(25)
+  mounted.stdin.write('\r')
+
+  await waitForCondition(() => setActiveProviderProfile.mock.calls.length > 0)
+  await waitForCondition(
+    () => applySavedProfileToCurrentSession.mock.calls.length > 0,
+  )
+  await Bun.sleep(50)
+  const output = stripAnsi(extractLastFrame(mounted.getOutput()))
+
+  expect(output).toContain(
+    'Active provider: Codex OAuth. Saved for next startup. Warning: validation failed.',
+  )
+  expect(applySavedProfileToCurrentSession).toHaveBeenCalled()
+  expect(setActiveProviderProfile).toHaveBeenCalledWith('provider_codex_oauth')
+
+  await mounted.dispose()
+})
+
+test('ProviderManager resolves Codex OAuth state from async storage without sync reads in render flow', async () => {
+  delete process.env.CLAUDE_CODE_SIMPLE
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+
+  const githubSyncRead = mock(() => undefined)
+  const githubAsyncRead = mock(async () => undefined)
+  const codexSyncRead = mock(() => {
+    throw new Error('sync codex credential read should not run in ProviderManager render flow')
+  })
+  const codexAsyncRead = mock(async () => ({
+    accessToken: 'codex-access-token',
+    refreshToken: 'codex-refresh-token',
+  }))
+
+  mockProviderManagerDependencies(githubSyncRead, githubAsyncRead, {
+    codexSyncRead,
+    codexAsyncRead,
+  })
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const output = await renderProviderManagerFrame(ProviderManager, {
+    waitForOutput: frame =>
+      frame.includes('Provider manager') &&
+      frame.includes('Log out Codex OAuth'),
+  })
+
+  expect(output).toContain('Provider manager')
+  expect(output).toContain('Log out Codex OAuth')
+  expect(codexSyncRead).not.toHaveBeenCalled()
+  expect(codexAsyncRead).toHaveBeenCalled()
+})
+
+test('ProviderManager hides Codex OAuth setup in bare mode', async () => {
+  process.env.CLAUDE_CODE_SIMPLE = '1'
+  delete process.env.CLAUDE_CODE_USE_GITHUB
+  delete process.env.GITHUB_TOKEN
+  delete process.env.GH_TOKEN
+
+  const githubSyncRead = mock(() => undefined)
+  const githubAsyncRead = mock(async () => undefined)
+
+  mockProviderManagerDependencies(githubSyncRead, githubAsyncRead)
+
+  const nonce = `${Date.now()}-${Math.random()}`
+  const { ProviderManager } = await import(`./ProviderManager.js?ts=${nonce}`)
+  const output = await renderProviderManagerFrame(ProviderManager, {
+    mode: 'first-run',
+    waitForOutput: frame =>
+      frame.includes('Set up provider') && frame.includes('OpenAI'),
+  })
+
+  expect(output).toContain('Set up provider')
+  expect(output).not.toContain('Codex OAuth')
 })

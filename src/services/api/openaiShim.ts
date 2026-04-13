@@ -15,21 +15,33 @@
  *   OPENAI_MODEL=gpt-4o              — default model override
  *   CODEX_API_KEY / ~/.codex/auth.json — Codex auth for codexplan/codexspark
  *
- * GitHub Models (models.github.ai), OpenAI-compatible:
+ * GitHub Copilot API (api.githubcopilot.com), OpenAI-compatible:
  *   CLAUDE_CODE_USE_GITHUB=1         — enable GitHub inference (no need for USE_OPENAI)
- *   GITHUB_TOKEN or GH_TOKEN         — PAT with models access (mapped to Bearer auth)
+ *   GITHUB_TOKEN or GH_TOKEN         — Copilot API token (mapped to Bearer auth)
  *   OPENAI_MODEL                     — optional; use github:copilot or openai/gpt-4.1 style IDs
  */
 
 import { APIError } from '@anthropic-ai/sdk'
-import { isEnvTruthy } from '../../utils/envUtils.js'
+import {
+  readCodexCredentialsAsync,
+  refreshCodexAccessTokenIfNeeded,
+} from '../../utils/codexCredentials.js'
+import { logForDebugging } from '../../utils/debug.js'
+import { isBareMode, isEnvTruthy } from '../../utils/envUtils.js'
 import { resolveGeminiCredential } from '../../utils/geminiAuth.js'
 import { hydrateGeminiAccessTokenFromSecureStorage } from '../../utils/geminiCredentials.js'
 import { hydrateGithubModelsTokenFromSecureStorage } from '../../utils/githubModelsCredentials.js'
 import {
+  looksLikeLeakedReasoningPrefix,
+  shouldBufferPotentialReasoningPrefix,
+  stripLeakedReasoningPreamble,
+} from './reasoningLeakSanitizer.js'
+import {
   codexStreamToAnthropic,
   collectCodexCompletedResponse,
+  convertAnthropicMessagesToResponsesInput,
   convertCodexResponseToAnthropicMessage,
+  convertToolsToResponsesTools,
   performCodexRequest,
   type AnthropicStreamEvent,
   type AnthropicUsage,
@@ -37,8 +49,9 @@ import {
 } from './codexShim.js'
 import {
   isLocalProviderUrl,
-  resolveCodexApiCredentials,
+  resolveRuntimeCodexCredentials,
   resolveProviderRequest,
+  getGithubEndpointType,
 } from './providerConfig.js'
 import { sanitizeSchemaForOpenAICompat } from '../../utils/schemaSanitizer.js'
 import { redactSecretValueForDisplay } from '../../utils/providerProfile.js'
@@ -53,17 +66,54 @@ type SecretValueSource = Partial<{
   GEMINI_API_KEY: string
   GOOGLE_API_KEY: string
   GEMINI_ACCESS_TOKEN: string
+  MISTRAL_API_KEY: string
 }>
 
-const GITHUB_MODELS_DEFAULT_BASE = 'https://models.github.ai/inference'
-const GITHUB_API_VERSION = '2022-11-28'
+const GITHUB_COPILOT_BASE = 'https://api.githubcopilot.com'
 const GITHUB_429_MAX_RETRIES = 3
 const GITHUB_429_BASE_DELAY_SEC = 1
 const GITHUB_429_MAX_DELAY_SEC = 32
 const GEMINI_API_HOST = 'generativelanguage.googleapis.com'
 
+const COPILOT_HEADERS: Record<string, string> = {
+  'User-Agent': 'GitHubCopilotChat/0.26.7',
+  'Editor-Version': 'vscode/1.99.3',
+  'Editor-Plugin-Version': 'copilot-chat/0.26.7',
+  'Copilot-Integration-Id': 'vscode-chat',
+}
+
 function isGithubModelsMode(): boolean {
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
+}
+
+function isMistralMode(): boolean {
+  return isEnvTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)
+}
+
+function filterAnthropicHeaders(
+  headers: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!headers) return {}
+
+  const filtered: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase()
+    if (
+      lower.startsWith('x-anthropic') ||
+      lower.startsWith('anthropic-') ||
+      lower.startsWith('x-claude') ||
+      lower === 'x-app' ||
+      lower === 'x-client-app' ||
+      lower === 'authorization' ||
+      lower === 'x-api-key' ||
+      lower === 'api-key'
+    ) {
+      continue
+    }
+    filtered[key] = value
+  }
+
+  return filtered
 }
 
 function hasGeminiApiHost(baseUrl: string | undefined): boolean {
@@ -131,35 +181,61 @@ function convertSystemPrompt(
   return String(system)
 }
 
-function convertToolResultContent(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return JSON.stringify(content ?? '')
+function convertToolResultContent(
+  content: unknown,
+  isError?: boolean,
+): string | Array<{ type: string; text?: string; image_url?: { url: string } }> {
+  if (typeof content === 'string') {
+    return isError ? `Error: ${content}` : content
+  }
+  if (!Array.isArray(content)) {
+    const text = JSON.stringify(content ?? '')
+    return isError ? `Error: ${text}` : text
+  }
 
-  const chunks: string[] = []
+  const parts: Array<{
+    type: string
+    text?: string
+    image_url?: { url: string }
+  }> = []
   for (const block of content) {
     if (block?.type === 'text' && typeof block.text === 'string') {
-      chunks.push(block.text)
+      parts.push({ type: 'text', text: block.text })
       continue
     }
 
     if (block?.type === 'image') {
       const source = block.source
       if (source?.type === 'url' && source.url) {
-        chunks.push(`[Image](${source.url})`)
-      } else if (source?.type === 'base64') {
-        chunks.push(`[image:${source.media_type ?? 'unknown'}]`)
-      } else {
-        chunks.push('[image]')
+        parts.push({ type: 'image_url', image_url: { url: source.url } })
+      } else if (source?.type === 'base64' && source.media_type && source.data) {
+        parts.push({
+          type: 'image_url',
+          image_url: {
+            url: `data:${source.media_type};base64,${source.data}`,
+          },
+        })
       }
       continue
     }
 
     if (typeof block?.text === 'string') {
-      chunks.push(block.text)
+      parts.push({ type: 'text', text: block.text })
     }
   }
 
-  return chunks.join('\n')
+  if (parts.length === 0) return ''
+  if (parts.length === 1 && parts[0].type === 'text') {
+    const text = parts[0].text ?? ''
+    return isError ? `Error: ${text}` : text
+  }
+  if (isError && parts[0]?.type === 'text') {
+    parts[0] = { ...parts[0], text: `Error: ${parts[0].text ?? ''}` }
+  } else if (isError) {
+    parts.unshift({ type: 'text', text: 'Error:' })
+  }
+
+  return parts
 }
 
 function convertContentBlocks(
@@ -195,10 +271,12 @@ function convertContentBlocks(
         // handled separately
         break
       case 'thinking':
-        // Append thinking as text with a marker for models that support reasoning
-        if (block.thinking) {
-          parts.push({ type: 'text', text: `<thinking>${block.thinking}</thinking>` })
-        }
+      case 'redacted_thinking':
+        // Strip thinking blocks for OpenAI-compatible providers.
+        // These are Anthropic-specific content types that 3P providers
+        // don't understand. Serializing them as <thinking> text corrupts
+        // multi-turn context: the model sees the tags as part of its
+        // previous reply and may mimic or misattribute them.
         break
       default:
         if (block.text) {
@@ -245,11 +323,10 @@ function convertMessages(
 
         // Emit tool results as tool messages
         for (const tr of toolResults) {
-          const trContent = convertToolResultContent(tr.content)
           result.push({
             role: 'tool',
             tool_call_id: tr.tool_use_id ?? 'unknown',
-            content: tr.is_error ? `Error: ${trContent}` : trContent,
+            content: convertToolResultContent(tr.content, tr.is_error),
           })
         }
 
@@ -410,11 +487,13 @@ function normalizeSchemaForOpenAI(
     record.properties = normalizedProps
 
     if (strict) {
-      // OpenAI strict mode requires every property to be listed in required[]
-      const allKeys = Object.keys(normalizedProps)
-      record.required = Array.from(new Set([...existingRequired, ...allKeys]))
-      // OpenAI strict mode requires additionalProperties: false on all object
-      // schemas — override unconditionally to ensure nested objects comply.
+      // Keep only the properties that were originally marked required in the schema.
+      // Adding every property to required[] (the previous behaviour) caused strict
+      // OpenAI-compatible providers (Groq, Azure, etc.) to reject tool calls because
+      // the model correctly omits optional arguments — but the provider treats them
+      // as missing required fields and returns a 400 / tool_use_failed error.
+      record.required = existingRequired.filter(k => k in normalizedProps)
+      // additionalProperties: false is still required by strict-mode providers.
       record.additionalProperties = false
     } else {
       // For Gemini: keep only existing required keys that are present in properties
@@ -520,11 +599,14 @@ function convertChunkUsage(
 ): Partial<AnthropicUsage> | undefined {
   if (!usage) return undefined
 
+  const cached = usage.prompt_tokens_details?.cached_tokens ?? 0
   return {
-    input_tokens: usage.prompt_tokens ?? 0,
+    // Subtract cached tokens: OpenAI includes them in prompt_tokens,
+    // but Anthropic convention treats input_tokens as non-cached only.
+    input_tokens: (usage.prompt_tokens ?? 0) - cached,
     output_tokens: usage.completion_tokens ?? 0,
     cache_creation_input_tokens: 0,
-    cache_read_input_tokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+    cache_read_input_tokens: cached,
   }
 }
 
@@ -575,6 +657,8 @@ async function* openaiStreamToAnthropic(
   let hasEmittedContentStart = false
   let hasEmittedThinkingStart = false
   let hasClosedThinking = false
+  let activeTextBuffer = ''
+  let textBufferMode: 'none' | 'pending' | 'strip' = 'none'
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
@@ -604,6 +688,30 @@ async function* openaiStreamToAnthropic(
 
   const decoder = new TextDecoder()
   let buffer = ''
+
+  const closeActiveContentBlock = async function* () {
+    if (!hasEmittedContentStart) return
+
+    if (textBufferMode !== 'none') {
+      const sanitized = stripLeakedReasoningPreamble(activeTextBuffer)
+      if (sanitized) {
+        yield {
+          type: 'content_block_delta',
+          index: contentBlockIndex,
+          delta: { type: 'text_delta', text: sanitized },
+        }
+      }
+    }
+
+    yield {
+      type: 'content_block_stop',
+      index: contentBlockIndex,
+    }
+    contentBlockIndex++
+    hasEmittedContentStart = false
+    activeTextBuffer = ''
+    textBufferMode = 'none'
+  }
 
   try {
     while (true) {
@@ -659,6 +767,7 @@ async function* openaiStreamToAnthropic(
             contentBlockIndex++
             hasClosedThinking = true
           }
+          activeTextBuffer += delta.content
           if (!hasEmittedContentStart) {
             yield {
               type: 'content_block_start',
@@ -666,6 +775,35 @@ async function* openaiStreamToAnthropic(
               content_block: { type: 'text', text: '' },
             }
             hasEmittedContentStart = true
+          }
+
+          if (
+            textBufferMode === 'strip' ||
+            looksLikeLeakedReasoningPrefix(activeTextBuffer)
+          ) {
+            textBufferMode = 'strip'
+            continue
+          }
+
+          if (textBufferMode === 'pending') {
+            if (shouldBufferPotentialReasoningPrefix(activeTextBuffer)) {
+              continue
+            }
+            yield {
+              type: 'content_block_delta',
+              index: contentBlockIndex,
+              delta: {
+                type: 'text_delta',
+                text: activeTextBuffer,
+              },
+            }
+            textBufferMode = 'none'
+            continue
+          }
+
+          if (shouldBufferPotentialReasoningPrefix(activeTextBuffer)) {
+            textBufferMode = 'pending'
+            continue
           }
           yield {
             type: 'content_block_delta',
@@ -685,12 +823,7 @@ async function* openaiStreamToAnthropic(
                 hasClosedThinking = true
               }
               if (hasEmittedContentStart) {
-                yield {
-                  type: 'content_block_stop',
-                  index: contentBlockIndex,
-                }
-                contentBlockIndex++
-                hasEmittedContentStart = false
+                yield* closeActiveContentBlock()
               }
 
               const toolBlockIndex = contentBlockIndex
@@ -773,10 +906,7 @@ async function* openaiStreamToAnthropic(
           }
           // Close any open content blocks
           if (hasEmittedContentStart) {
-            yield {
-              type: 'content_block_stop',
-              index: contentBlockIndex,
-            }
+            yield* closeActiveContentBlock()
           }
           // Close active tool calls
           for (const [, tc] of activeToolCalls) {
@@ -923,7 +1053,7 @@ class OpenAIShimMessages {
   private providerOverride?: { model: string; baseURL: string; apiKey: string }
 
   constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
-    this.defaultHeaders = defaultHeaders
+    this.defaultHeaders = filterAnthropicHeaders(defaultHeaders)
     this.reasoningEffort = reasoningEffort
     this.providerOverride = providerOverride
   }
@@ -942,8 +1072,9 @@ class OpenAIShimMessages {
       httpResponse = response
 
       if (params.stream) {
+        const isResponsesStream = response.url?.includes('/responses')
         return new OpenAIShimStream(
-          request.transport === 'codex_responses'
+          (request.transport === 'codex_responses' || isResponsesStream)
             ? codexStreamToAnthropic(response, request.resolvedModel)
             : openaiStreamToAnthropic(response, request.resolvedModel),
         )
@@ -957,8 +1088,38 @@ class OpenAIShimMessages {
         )
       }
 
-      const data = await response.json()
-      return self._convertNonStreamingResponse(data, request.resolvedModel)
+      const isResponsesNonStream = response.url?.includes('/responses')
+      if (isResponsesNonStream || (request.transport === 'chat_completions' && isGithubModelsMode())) {
+        const contentType = response.headers.get('content-type') ?? ''
+        if (contentType.includes('application/json')) {
+          const parsed = await response.json() as Record<string, unknown>
+          if (
+            parsed &&
+            typeof parsed === 'object' &&
+            ('output' in parsed || 'incomplete_details' in parsed)
+          ) {
+            return convertCodexResponseToAnthropicMessage(
+              parsed,
+              request.resolvedModel,
+            )
+          }
+          return self._convertNonStreamingResponse(parsed, request.resolvedModel)
+        }
+      }
+
+      const contentType = response.headers.get('content-type') ?? ''
+      if (contentType.includes('application/json')) {
+        const data = await response.json()
+        return self._convertNonStreamingResponse(data, request.resolvedModel)
+      }
+
+      const textBody = await response.text().catch(() => '')
+      throw APIError.generate(
+        response.status,
+        undefined,
+        `OpenAI API error ${response.status}: unexpected response: ${textBody.slice(0, 500)}`,
+        response.headers as unknown as Headers,
+      )
     })()
 
       ; (promise as unknown as Record<string, unknown>).withResponse =
@@ -980,12 +1141,55 @@ class OpenAIShimMessages {
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
   ): Promise<Response> {
-    if (request.transport === 'codex_responses') {
-      const credentials = resolveCodexApiCredentials()
+    const githubEndpointType = getGithubEndpointType(request.baseUrl)
+    const isGithubMode = isGithubModelsMode()
+    const isGithubWithCodexTransport = isGithubMode && request.transport === 'codex_responses'
+
+    if (isGithubWithCodexTransport) {
+      const apiKey = this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
+      if (!apiKey) {
+        throw new Error(
+          'GitHub Copilot auth is required. Run /onboard-github to sign in.',
+        )
+      }
+
+      return performCodexRequest({
+        request,
+        credentials: {
+          apiKey,
+          source: 'env',
+        },
+        params,
+        defaultHeaders: {
+          ...this.defaultHeaders,
+          ...filterAnthropicHeaders(options?.headers),
+          ...COPILOT_HEADERS,
+        },
+        signal: options?.signal,
+      })
+    }
+
+    if (request.transport === 'codex_responses' && !isGithubMode) {
+      const refreshResult = await refreshCodexAccessTokenIfNeeded().catch(
+        async error => {
+          logForDebugging(
+            `[codex] access token refresh failed before request: ${error instanceof Error ? error.message : String(error)}`,
+            { level: 'warn' },
+          )
+          return {
+            refreshed: false,
+            credentials: await readCodexCredentialsAsync(),
+          }
+        },
+      )
+      const credentials = resolveRuntimeCodexCredentials({
+        storedCredentials: refreshResult.credentials,
+      })
       if (!credentials.apiKey) {
+        const oauthHint = isBareMode() ? '' : ', choose Codex OAuth in /provider'
         const authHint = credentials.authPath
-          ? ` or place a Codex auth.json at ${credentials.authPath}`
-          : ''
+          ? `${oauthHint} or place a Codex auth.json at ${credentials.authPath}`
+          : oauthHint
         const safeModel =
           redactSecretValueForDisplay(request.requestedModel, process.env as SecretValueSource) ??
           'the requested model'
@@ -995,7 +1199,7 @@ class OpenAIShimMessages {
       }
       if (!credentials.accountId) {
         throw new Error(
-          'Codex auth is missing chatgpt_account_id. Re-login with the Codex CLI or set CHATGPT_ACCOUNT_ID/CODEX_ACCOUNT_ID.',
+          'Codex auth is missing chatgpt_account_id. Re-login with Codex OAuth, the Codex CLI, or set CHATGPT_ACCOUNT_ID/CODEX_ACCOUNT_ID.',
         )
       }
 
@@ -1005,7 +1209,7 @@ class OpenAIShimMessages {
         params,
         defaultHeaders: {
           ...this.defaultHeaders,
-          ...(options?.headers ?? {}),
+          ...filterAnthropicHeaders(options?.headers),
         },
         signal: options?.signal,
       })
@@ -1032,6 +1236,7 @@ class OpenAIShimMessages {
       model: request.resolvedModel,
       messages: openaiMessages,
       stream: params.stream ?? false,
+      store: false,
     }
     // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
     // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.
@@ -1054,9 +1259,21 @@ class OpenAIShimMessages {
     }
 
     const isGithub = isGithubModelsMode()
-    if (isGithub && body.max_completion_tokens !== undefined) {
+    const isMistral = isMistralMode()
+    const isLocal = isLocalProviderUrl(request.baseUrl)
+
+    const githubEndpointType = getGithubEndpointType(request.baseUrl)
+    const isGithubCopilot = isGithub && githubEndpointType === 'copilot'
+    const isGithubModels = isGithub && (githubEndpointType === 'models' || githubEndpointType === 'custom')
+
+    if ((isGithub || isMistral || isLocal) && body.max_completion_tokens !== undefined) {
       body.max_tokens = body.max_completion_tokens
       delete body.max_completion_tokens
+    }
+
+    // mistral also doesn't recognize body.store
+    if (isMistral) {
+      delete body.store
     }
 
     if (params.temperature !== undefined) body.temperature = params.temperature
@@ -1093,12 +1310,11 @@ class OpenAIShimMessages {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...this.defaultHeaders,
-      ...(options?.headers ?? {}),
+      ...filterAnthropicHeaders(options?.headers),
     }
 
-    const isGemini = isGeminiMode()
-    const apiKey =
-      this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
+    const isGemini = isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
+    const apiKey = this.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? ''
     // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
     // path segments like https://evil.com/cognitiveservices.azure.com/
     let isAzure = false
@@ -1119,15 +1335,17 @@ class OpenAIShimMessages {
       const geminiCredential = await resolveGeminiCredential(process.env)
       if (geminiCredential.kind !== 'none') {
         headers.Authorization = `Bearer ${geminiCredential.credential}`
-        if (geminiCredential.projectId) {
+        if (geminiCredential.kind !== 'api-key' && 'projectId' in geminiCredential && geminiCredential.projectId) {
           headers['x-goog-user-project'] = geminiCredential.projectId
         }
       }
     }
 
-    if (isGithub) {
-      headers.Accept = 'application/vnd.github.v3+json'
-      headers['X-GitHub-Api-Version'] = GITHUB_API_VERSION
+    if (isGithubCopilot) {
+      Object.assign(headers, COPILOT_HEADERS)
+    } else if (isGithubModels) {
+      headers['Accept'] = 'application/vnd.github+json'
+      headers['X-GitHub-Api-Version'] = '2022-11-28'
     }
 
     // Build the chat completions URL
@@ -1179,9 +1397,83 @@ class OpenAIShimMessages {
         await sleepMs(delaySec * 1000)
         continue
       }
+      // Read body exactly once here — Response body is a stream that can only
+      // be consumed a single time.
       const errorBody = await response.text().catch(() => 'unknown error')
       const rateHint =
         isGithub && response.status === 429 ? formatRetryAfterHint(response) : ''
+
+      // If GitHub Copilot returns error about /chat/completions,
+      // try the /responses endpoint (needed for GPT-5+ models)
+      if (isGithub && response.status === 400) {
+        if (errorBody.includes('/chat/completions') || errorBody.includes('not accessible')) {
+          const responsesUrl = `${request.baseUrl}/responses`
+          const responsesBody: Record<string, unknown> = {
+            model: request.resolvedModel,
+            input: convertAnthropicMessagesToResponsesInput(
+              params.messages as Array<{
+                role?: string
+                message?: { role?: string; content?: unknown }
+                content?: unknown
+              }>,
+            ),
+            stream: params.stream ?? false,
+            store: false,
+          }
+
+          if (!Array.isArray(responsesBody.input) || responsesBody.input.length === 0) {
+            responsesBody.input = [
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: '' }],
+              },
+            ]
+          }
+
+          const systemText = convertSystemPrompt(params.system)
+          if (systemText) {
+            responsesBody.instructions = systemText
+          }
+
+          if (body.max_tokens !== undefined) {
+            responsesBody.max_output_tokens = body.max_tokens
+          }
+
+          if (params.tools && params.tools.length > 0) {
+            const convertedTools = convertToolsToResponsesTools(
+              params.tools as Array<{
+                name?: string
+                description?: string
+                input_schema?: Record<string, unknown>
+              }>,
+            )
+            if (convertedTools.length > 0) {
+              responsesBody.tools = convertedTools
+            }
+          }
+
+          const responsesResponse = await fetch(responsesUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(responsesBody),
+            signal: options?.signal,
+          })
+          if (responsesResponse.ok) {
+            return responsesResponse
+          }
+          const responsesErrorBody = await responsesResponse.text().catch(() => 'unknown error')
+          let responsesErrorResponse: object | undefined
+          try { responsesErrorResponse = JSON.parse(responsesErrorBody) } catch { /* raw text */ }
+          throw APIError.generate(
+            responsesResponse.status,
+            responsesErrorResponse,
+            `OpenAI API error ${responsesResponse.status}: ${responsesErrorBody}`,
+            responsesResponse.headers,
+          )
+        }
+      }
+
       let errorResponse: object | undefined
       try { errorResponse = JSON.parse(errorBody) } catch { /* raw text */ }
       throw APIError.generate(
@@ -1231,9 +1523,9 @@ class OpenAIShimMessages {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
 
-    // Some reasoning models (e.g. GLM-5) put their reply in reasoning_content
-    // while content stays null — emit reasoning as a thinking block, then
-    // fall back to it for visible text if content is empty.
+    // Some reasoning models (e.g. GLM-5) put their chain-of-thought in
+    // reasoning_content while content stays null. Preserve it as a thinking
+    // block, but do not surface it as visible assistant text.
     const reasoningText = choice?.message?.reasoning_content
     if (typeof reasoningText === 'string' && reasoningText) {
       content.push({ type: 'thinking', thinking: reasoningText })
@@ -1241,9 +1533,12 @@ class OpenAIShimMessages {
     const rawContent =
       choice?.message?.content !== '' && choice?.message?.content != null
         ? choice?.message?.content
-        : choice?.message?.reasoning_content
+        : null
     if (typeof rawContent === 'string' && rawContent) {
-      content.push({ type: 'text', text: rawContent })
+      content.push({
+        type: 'text',
+        text: stripLeakedReasoningPreamble(rawContent),
+      })
     } else if (Array.isArray(rawContent) && rawContent.length > 0) {
       const parts: string[] = []
       for (const part of rawContent) {
@@ -1258,7 +1553,10 @@ class OpenAIShimMessages {
       }
       const joined = parts.join('\n')
       if (joined) {
-        content.push({ type: 'text', text: joined })
+        content.push({
+          type: 'text',
+          text: stripLeakedReasoningPreamble(joined),
+        })
       }
     }
 
@@ -1348,8 +1646,15 @@ export function createOpenAIShimClient(options: {
     if (process.env.GEMINI_MODEL && !process.env.OPENAI_MODEL) {
       process.env.OPENAI_MODEL = process.env.GEMINI_MODEL
     }
+  } else if (isEnvTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)) {
+    process.env.OPENAI_BASE_URL =
+      process.env.MISTRAL_BASE_URL ?? 'https://api.mistral.ai/v1'
+    process.env.OPENAI_API_KEY = process.env.MISTRAL_API_KEY
+    if (process.env.MISTRAL_MODEL) {
+      process.env.OPENAI_MODEL = process.env.MISTRAL_MODEL
+    }
   } else if (isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)) {
-    process.env.OPENAI_BASE_URL ??= GITHUB_MODELS_DEFAULT_BASE
+    process.env.OPENAI_BASE_URL ??= GITHUB_COPILOT_BASE
     process.env.OPENAI_API_KEY ??=
       process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? ''
   }

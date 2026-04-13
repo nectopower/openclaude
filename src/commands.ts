@@ -32,6 +32,7 @@ import logout from './commands/logout/index.js'
 import installGitHubApp from './commands/install-github-app/index.js'
 import installSlackApp from './commands/install-slack-app/index.js'
 import breakCache from './commands/break-cache/index.js'
+import cacheProbe from './commands/cache-probe/index.js'
 import mcp from './commands/mcp/index.js'
 import mobile from './commands/mobile/index.js'
 import onboarding from './commands/onboarding/index.js'
@@ -134,6 +135,7 @@ import hooks from './commands/hooks/index.js'
 import files from './commands/files/index.js'
 import branch from './commands/branch/index.js'
 import agents from './commands/agents/index.js'
+import autoFix from './commands/auto-fix.js'
 import plugin from './commands/plugin/index.js'
 import reloadPlugins from './commands/reload-plugins/index.js'
 import rewind from './commands/rewind/index.js'
@@ -141,6 +143,7 @@ import heapDump from './commands/heapdump/index.js'
 import mockLimits from './commands/mock-limits/index.js'
 import bridgeKick from './commands/bridge-kick.js'
 import version from './commands/version.js'
+import wiki from './commands/wiki/index.js'
 import summary from './commands/summary/index.js'
 import {
   resetLimits,
@@ -261,8 +264,10 @@ const COMMANDS = memoize((): Command[] => [
   addDir,
   advisor,
   agents,
+  autoFix,
   branch,
   btw,
+  cacheProbe,
   chrome,
   clear,
   color,
@@ -322,6 +327,7 @@ const COMMANDS = memoize((): Command[] => [
   usage,
   usageReport,
   vim,
+  wiki,
   ...(webCmd ? [webCmd] : []),
   ...(forkCmd ? [forkCmd] : []),
   ...(buddy ? [buddy] : []),

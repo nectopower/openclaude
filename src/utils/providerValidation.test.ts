@@ -3,11 +3,10 @@ import { afterEach, expect, test } from 'bun:test'
 import { getProviderValidationError } from './providerValidation.ts'
 
 const originalEnv = {
-  CLAUDE_CODE_USE_GEMINI: process.env.CLAUDE_CODE_USE_GEMINI,
   CLAUDE_CODE_USE_OPENAI: process.env.CLAUDE_CODE_USE_OPENAI,
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
   OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
-  OPENAI_MODEL: process.env.OPENAI_MODEL,
+  CLAUDE_CODE_USE_GEMINI: process.env.CLAUDE_CODE_USE_GEMINI,
   GEMINI_API_KEY: process.env.GEMINI_API_KEY,
   GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
   GEMINI_ACCESS_TOKEN: process.env.GEMINI_ACCESS_TOKEN,
@@ -24,11 +23,10 @@ function restoreEnv(key: string, value: string | undefined): void {
 }
 
 afterEach(() => {
-  restoreEnv('CLAUDE_CODE_USE_GEMINI', originalEnv.CLAUDE_CODE_USE_GEMINI)
   restoreEnv('CLAUDE_CODE_USE_OPENAI', originalEnv.CLAUDE_CODE_USE_OPENAI)
   restoreEnv('OPENAI_API_KEY', originalEnv.OPENAI_API_KEY)
   restoreEnv('OPENAI_BASE_URL', originalEnv.OPENAI_BASE_URL)
-  restoreEnv('OPENAI_MODEL', originalEnv.OPENAI_MODEL)
+  restoreEnv('CLAUDE_CODE_USE_GEMINI', originalEnv.CLAUDE_CODE_USE_GEMINI)
   restoreEnv('GEMINI_API_KEY', originalEnv.GEMINI_API_KEY)
   restoreEnv('GOOGLE_API_KEY', originalEnv.GOOGLE_API_KEY)
   restoreEnv('GEMINI_ACCESS_TOKEN', originalEnv.GEMINI_ACCESS_TOKEN)
@@ -80,15 +78,18 @@ test('still errors when no Gemini credential source is available', async () => {
   )
 })
 
-test('allows interactive startup recovery when remote OpenAI key is missing', async () => {
+test('openai missing key error includes recovery guidance and config locations', async () => {
   process.env.CLAUDE_CODE_USE_OPENAI = '1'
   process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
-  process.env.OPENAI_MODEL = 'gpt-4o'
   delete process.env.OPENAI_API_KEY
 
-  await expect(
-    getProviderValidationError(process.env, {
-      allowInteractiveRecovery: true,
-    }),
-  ).resolves.toBeNull()
+  const message = await getProviderValidationError(process.env)
+  expect(message).toContain(
+    'OPENAI_API_KEY is required when CLAUDE_CODE_USE_OPENAI=1 and OPENAI_BASE_URL is not local.',
+  )
+  expect(message).toContain(
+    'set CLAUDE_CODE_USE_OPENAI=0 in your shell environment',
+  )
+  expect(message).toContain('Saved startup settings can come from')
+  expect(message).toContain('.openclaude-profile.json')
 })
