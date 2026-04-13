@@ -1,8 +1,20 @@
 import figures from 'figures'
 import * as React from 'react'
+import { DEFAULT_CODEX_BASE_URL } from '../services/api/providerConfig.js'
 import { Box, Text } from '../ink.js'
 import { useKeybinding } from '../keybindings/useKeybinding.js'
 import type { ProviderProfile } from '../utils/config.js'
+import {
+  clearCodexCredentials,
+  readCodexCredentialsAsync,
+} from '../utils/codexCredentials.js'
+import { isBareMode, isEnvTruthy } from '../utils/envUtils.js'
+import {
+  applySavedProfileToCurrentSession,
+  buildCodexOAuthProfileEnv,
+  clearPersistedCodexOAuthProfile,
+  createProfileFile,
+} from '../utils/providerProfile.js'
 import {
   addProviderProfile,
   applyActiveProviderProfileFromConfig,
@@ -22,11 +34,22 @@ import {
   readGithubModelsToken,
   readGithubModelsTokenAsync,
 } from '../utils/githubModelsCredentials.js'
-import { isEnvTruthy } from '../utils/envUtils.js'
+import {
+  hasLocalOllama,
+  listOllamaModels,
+} from '../utils/providerDiscovery.js'
+import {
+  rankOllamaModels,
+  recommendOllamaModel,
+} from '../utils/providerRecommendation.js'
 import { updateSettingsForSource } from '../utils/settings/settings.js'
-import { Select } from './CustomSelect/index.js'
+import {
+  type OptionWithDescription,
+  Select,
+} from './CustomSelect/index.js'
 import { Pane } from './design-system/Pane.js'
 import TextInput from './TextInput.js'
+import { useCodexOAuthFlow } from './useCodexOAuthFlow.js'
 
 export type ProviderManagerResult = {
   action: 'saved' | 'cancelled'
@@ -42,6 +65,8 @@ type Props = {
 type Screen =
   | 'menu'
   | 'select-preset'
+  | 'select-ollama-model'
+  | 'codex-oauth'
   | 'form'
   | 'select-active'
   | 'select-edit'
@@ -50,6 +75,16 @@ type Screen =
 type DraftField = 'name' | 'baseUrl' | 'model' | 'apiKey'
 
 type ProviderDraft = Record<DraftField, string>
+
+type OllamaSelectionState =
+  | { state: 'idle' }
+  | { state: 'loading' }
+  | {
+      state: 'ready'
+      options: OptionWithDescription<string>[]
+      defaultValue?: string
+    }
+  | { state: 'unavailable'; message: string }
 
 const FORM_STEPS: Array<{
   key: DraftField
@@ -89,6 +124,8 @@ const GITHUB_PROVIDER_ID = '__github_models__'
 const GITHUB_PROVIDER_LABEL = 'GitHub Models'
 const GITHUB_PROVIDER_DEFAULT_MODEL = 'github:copilot'
 const GITHUB_PROVIDER_DEFAULT_BASE_URL = 'https://models.github.ai/inference'
+const CODEX_OAUTH_PROVIDER_NAME = 'Codex OAuth'
+const CODEX_OAUTH_PROVIDER_MODEL = 'codexplan'
 
 type GithubCredentialSource = 'stored' | 'env' | 'none'
 
@@ -177,6 +214,111 @@ function getGithubProviderSummary(
   return `github-models · ${GITHUB_PROVIDER_DEFAULT_BASE_URL} · ${getGithubProviderModel(processEnv)} · ${credentialSummary}${activeSuffix}`
 }
 
+function findCodexOAuthProfile(
+  profiles: ProviderProfile[],
+  profileId?: string,
+): ProviderProfile | undefined {
+  if (!profileId) {
+    return undefined
+  }
+
+  return profiles.find(profile => profile.id === profileId)
+}
+
+function isCodexOAuthProfile(
+  profile: ProviderProfile | null | undefined,
+  profileId?: string,
+): boolean {
+  return Boolean(profile && profileId && profile.id === profileId)
+}
+
+function CodexOAuthSetup({
+  onBack,
+  onConfigured,
+}: {
+  onBack: () => void
+  onConfigured: (tokens: {
+    accessToken: string
+    refreshToken: string
+    accountId?: string
+    idToken?: string
+    apiKey?: string
+  }, persistCredentials: (options?: { profileId?: string }) => void) => void | Promise<void>
+}): React.ReactNode {
+  const handleAuthenticated = React.useCallback(async (tokens: {
+    accessToken: string
+    refreshToken: string
+    accountId?: string
+    idToken?: string
+    apiKey?: string
+  }, persistCredentials: (options?: { profileId?: string }) => void) => {
+    await onConfigured(tokens, persistCredentials)
+  }, [onConfigured])
+  useKeybinding('confirm:no', onBack, [onBack])
+
+  const status = useCodexOAuthFlow({
+    onAuthenticated: handleAuthenticated,
+  })
+
+  if (status.state === 'error') {
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text color="error" bold>
+          Codex OAuth failed
+        </Text>
+        <Text>{status.message}</Text>
+        <Text dimColor>Press Enter or Esc to go back.</Text>
+        <Select
+          options={[
+            {
+              value: 'back',
+              label: 'Back',
+              description: 'Return to provider presets',
+            },
+          ]}
+          onChange={onBack}
+          onCancel={onBack}
+          visibleOptionCount={1}
+        />
+      </Box>
+    )
+  }
+
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text color="remember" bold>
+        Codex OAuth
+      </Text>
+      <Text>
+        Sign in with your ChatGPT account in the browser. OpenClaude will store
+        the resulting Codex credentials securely and switch this session to the
+        new Codex login when setup completes.
+      </Text>
+      {status.state === 'starting' ? (
+        <Text dimColor>Starting local callback and preparing your browser...</Text>
+      ) : status.browserOpened === false ? (
+        <>
+          <Text color="warning">
+            Browser did not open automatically. Visit this URL to continue:
+          </Text>
+          <Text>{status.authUrl}</Text>
+        </>
+      ) : status.browserOpened === true ? (
+        <>
+          <Text dimColor>
+            Browser opened. Finish the ChatGPT sign-in there and this setup will
+            complete automatically.
+          </Text>
+          <Text>{status.authUrl}</Text>
+        </>
+      ) : (
+        <Text dimColor>Opening your browser...</Text>
+      )}
+      <Text dimColor>Press Esc to cancel and go back.</Text>
+    </Box>
+  )
+}
+
 export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const initialGithubCredentialSource = getGithubCredentialSourceFromEnv()
   const initialIsGithubActive = isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
@@ -196,6 +338,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const [isGithubCredentialSourceResolved, setIsGithubCredentialSourceResolved] =
     React.useState(() => initialHasGithubCredential || initialIsGithubActive)
   const githubRefreshEpochRef = React.useRef(0)
+  const codexRefreshEpochRef = React.useRef(0)
   const [screen, setScreen] = React.useState<Screen>(
     mode === 'first-run' ? 'select-preset' : 'menu',
   )
@@ -210,6 +353,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   const [cursorOffset, setCursorOffset] = React.useState(0)
   const [statusMessage, setStatusMessage] = React.useState<string | undefined>()
   const [errorMessage, setErrorMessage] = React.useState<string | undefined>()
+  const [hasStoredCodexOAuthCredentials, setHasStoredCodexOAuthCredentials] =
+    React.useState(false)
+  const [storedCodexOAuthProfileId, setStoredCodexOAuthProfileId] =
+    React.useState<string | undefined>()
+  const [ollamaSelection, setOllamaSelection] = React.useState<OllamaSelectionState>({
+    state: 'idle',
+  })
 
   const currentStep = FORM_STEPS[formStepIndex] ?? FORM_STEPS[0]
   const currentStepKey = currentStep.key
@@ -244,19 +394,102 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     })()
   }, [])
 
+  const refreshCodexOAuthCredentialState = React.useCallback((): void => {
+    if (isBareMode()) {
+      codexRefreshEpochRef.current += 1
+      setHasStoredCodexOAuthCredentials(false)
+      setStoredCodexOAuthProfileId(undefined)
+      return
+    }
+
+    const refreshEpoch = ++codexRefreshEpochRef.current
+    void (async () => {
+      const credentials = await readCodexCredentialsAsync()
+      if (refreshEpoch !== codexRefreshEpochRef.current) {
+        return
+      }
+
+      setHasStoredCodexOAuthCredentials(
+        Boolean(
+          credentials?.apiKey ||
+            credentials?.accessToken ||
+            credentials?.refreshToken ||
+            credentials?.idToken,
+        ),
+      )
+      setStoredCodexOAuthProfileId(credentials?.profileId)
+    })()
+  }, [])
+
   React.useEffect(() => {
     refreshGithubProviderState()
+    refreshCodexOAuthCredentialState()
 
     return () => {
       githubRefreshEpochRef.current += 1
+      codexRefreshEpochRef.current += 1
     }
-  }, [refreshGithubProviderState])
+  }, [refreshCodexOAuthCredentialState, refreshGithubProviderState])
+
+  React.useEffect(() => {
+    if (screen !== 'select-ollama-model') {
+      return
+    }
+
+    let cancelled = false
+    setOllamaSelection({ state: 'loading' })
+
+    void (async () => {
+      const available = await hasLocalOllama(draft.baseUrl)
+      if (!available) {
+        if (!cancelled) {
+          setOllamaSelection({
+            state: 'unavailable',
+            message:
+              'Could not reach Ollama. Start Ollama first, or enter the endpoint manually.',
+          })
+        }
+        return
+      }
+
+      const models = await listOllamaModels(draft.baseUrl)
+      if (models.length === 0) {
+        if (!cancelled) {
+          setOllamaSelection({
+            state: 'unavailable',
+            message:
+              'Ollama is running, but no installed models were found. Pull a chat model such as qwen2.5-coder:7b or llama3.1:8b first, or enter details manually.',
+          })
+        }
+        return
+      }
+
+      const ranked = rankOllamaModels(models, 'balanced')
+      const recommended = recommendOllamaModel(models, 'balanced')
+      if (!cancelled) {
+        setOllamaSelection({
+          state: 'ready',
+          defaultValue: recommended?.name ?? ranked[0]?.name,
+          options: ranked.map(model => ({
+            label: model.name,
+            value: model.name,
+            description: model.summary,
+          })),
+        })
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [draft.baseUrl, screen])
 
   function refreshProfiles(): void {
     const nextProfiles = getProviderProfiles()
     setProfiles(nextProfiles)
     setActiveProfileId(getActiveProviderProfile()?.id)
     refreshGithubProviderState()
+    refreshCodexOAuthCredentialState()
   }
 
   function clearStartupProviderOverrideFromUserSettings(): string | null {
@@ -271,6 +504,123 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       },
     })
     return error ? error.message : null
+  }
+
+  function buildCodexOAuthActivationMessage(options: {
+    prefix: string
+    activationWarning: string | null
+    warnings: string[]
+  }): string {
+    if (options.activationWarning) {
+      return `${options.prefix}. Saved for next startup. Warning: ${options.warnings.join('; ')}.`
+    }
+
+    if (options.warnings.length > 0) {
+      return `${options.prefix}. OpenClaude switched to it for this session with warnings: ${options.warnings.join('; ')}.`
+    }
+
+    return `${options.prefix}. OpenClaude switched to it for this session.`
+  }
+
+  async function activateCodexOAuthSession(tokens?: {
+    accessToken: string
+    refreshToken?: string
+    accountId?: string
+    idToken?: string
+  }): Promise<string | null> {
+    const oauthEnv = buildCodexOAuthProfileEnv({
+      accessToken: tokens?.accessToken ?? '',
+      accountId: tokens?.accountId,
+      idToken: tokens?.idToken,
+    })
+
+    if (oauthEnv) {
+      return applySavedProfileToCurrentSession({
+        profileFile: createProfileFile('codex', oauthEnv),
+      })
+    }
+
+    const storedCredentials = await readCodexCredentialsAsync()
+    if (!storedCredentials) {
+      return 'stored Codex OAuth credentials could not be loaded'
+    }
+
+    const storedEnv = buildCodexOAuthProfileEnv({
+      accessToken: storedCredentials.accessToken,
+      accountId: storedCredentials.accountId,
+      idToken: storedCredentials.idToken,
+    })
+    if (!storedEnv) {
+      return 'stored Codex OAuth credentials are missing a ChatGPT account id'
+    }
+
+    return applySavedProfileToCurrentSession({
+      profileFile: createProfileFile('codex', storedEnv),
+    })
+  }
+
+  async function activateSelectedProvider(profileId: string): Promise<void> {
+    let providerLabel = 'provider'
+
+    try {
+      if (profileId === GITHUB_PROVIDER_ID) {
+        providerLabel = GITHUB_PROVIDER_LABEL
+        const githubError = activateGithubProvider()
+        if (githubError) {
+          setErrorMessage(`Could not activate GitHub provider: ${githubError}`)
+          setScreen('menu')
+          return
+        }
+
+        refreshProfiles()
+        setStatusMessage(`Active provider: ${GITHUB_PROVIDER_LABEL}`)
+        setScreen('menu')
+        return
+      }
+
+      const active = setActiveProviderProfile(profileId)
+      if (!active) {
+        setErrorMessage('Could not change active provider.')
+        setScreen('menu')
+        return
+      }
+
+      providerLabel = active.name
+      const settingsOverrideError =
+        clearStartupProviderOverrideFromUserSettings()
+      const isActiveCodexOAuth = isCodexOAuthProfile(
+        active,
+        storedCodexOAuthProfileId,
+      )
+      const activationWarning = isActiveCodexOAuth
+        ? await activateCodexOAuthSession()
+        : null
+
+      refreshProfiles()
+      setStatusMessage(
+        isActiveCodexOAuth
+          ? buildCodexOAuthActivationMessage({
+              prefix: `Active provider: ${active.name}`,
+              activationWarning,
+              warnings: [
+                activationWarning,
+                settingsOverrideError
+                  ? `could not clear startup provider override (${settingsOverrideError})`
+                  : null,
+              ].filter((warning): warning is string => Boolean(warning)),
+            })
+          : settingsOverrideError
+            ? `Active provider: ${active.name}. Warning: could not clear startup provider override (${settingsOverrideError}).`
+            : `Active provider: ${active.name}`,
+      )
+      setScreen('menu')
+    } catch (error) {
+      refreshProfiles()
+      setStatusMessage(undefined)
+      const detail = error instanceof Error ? error.message : String(error)
+      setErrorMessage(`Could not finish activating ${providerLabel}: ${detail}`)
+      setScreen('menu')
+    }
   }
 
   function closeWithCancelled(message: string): void {
@@ -378,6 +728,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     setFormStepIndex(0)
     setCursorOffset(nextDraft.name.length)
     setErrorMessage(undefined)
+
+    if (preset === 'ollama') {
+      setOllamaSelection({ state: 'loading' })
+      setScreen('select-ollama-model')
+      return
+    }
+
     setScreen('form')
   }
 
@@ -397,13 +754,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     setScreen('form')
   }
 
-  function persistDraft(): void {
+  function persistDraft(nextDraft: ProviderDraft = draft): void {
     const payload: ProviderProfileInput = {
       provider: draftProvider,
-      name: draft.name,
-      baseUrl: draft.baseUrl,
-      model: draft.model,
-      apiKey: draft.apiKey,
+      name: nextDraft.name,
+      baseUrl: nextDraft.baseUrl,
+      model: nextDraft.model,
+      apiKey: nextDraft.apiKey,
     }
 
     const saved = editingProfileId
@@ -446,6 +803,83 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     setScreen('menu')
   }
 
+  function renderOllamaSelection(): React.ReactNode {
+    if (ollamaSelection.state === 'loading' || ollamaSelection.state === 'idle') {
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text color="remember" bold>
+            Checking Ollama
+          </Text>
+          <Text dimColor>Looking for installed Ollama models...</Text>
+        </Box>
+      )
+    }
+
+    if (ollamaSelection.state === 'unavailable') {
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text color="remember" bold>
+            Ollama setup
+          </Text>
+          <Text dimColor>{ollamaSelection.message}</Text>
+          <Select
+            options={[
+              {
+                value: 'manual',
+                label: 'Enter manually',
+                description: 'Fill in the base URL and model yourself',
+              },
+              {
+                value: 'back',
+                label: 'Back',
+                description: 'Choose another provider preset',
+              },
+            ]}
+            onChange={(value: string) => {
+              if (value === 'manual') {
+                setFormStepIndex(0)
+                setCursorOffset(draft.name.length)
+                setScreen('form')
+                return
+              }
+              setScreen('select-preset')
+            }}
+            onCancel={() => setScreen('select-preset')}
+            visibleOptionCount={2}
+          />
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        <Text color="remember" bold>
+          Choose an Ollama model
+        </Text>
+        <Text dimColor>
+          Pick one of the installed Ollama models to save into a local provider
+          profile.
+        </Text>
+        <Select
+          options={ollamaSelection.options}
+          defaultValue={ollamaSelection.defaultValue}
+          defaultFocusValue={ollamaSelection.defaultValue}
+          inlineDescriptions
+          visibleOptionCount={Math.min(8, ollamaSelection.options.length)}
+          onChange={(value: string) => {
+            const nextDraft = {
+              ...draft,
+              model: value,
+            }
+            setDraft(nextDraft)
+            persistDraft(nextDraft)
+          }}
+          onCancel={() => setScreen('select-preset')}
+        />
+      </Box>
+    )
+  }
+
   function handleFormSubmit(value: string): void {
     const trimmed = value.trim()
 
@@ -470,7 +904,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       return
     }
 
-    persistDraft()
+    persistDraft(nextDraft)
   }
 
   function handleBackFromForm(): void {
@@ -498,6 +932,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   })
 
   function renderPresetSelection(): React.ReactNode {
+    const canUseCodexOAuth = !isBareMode()
     const options = [
       {
         value: 'anthropic',
@@ -514,6 +949,16 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         label: 'OpenAI',
         description: 'OpenAI API with API key',
       },
+      ...(canUseCodexOAuth
+        ? [
+            {
+              value: 'codex-oauth',
+              label: 'Codex OAuth',
+              description:
+                'Sign in with ChatGPT in your browser and store Codex credentials securely',
+            },
+          ]
+        : []),
       {
         value: 'moonshotai',
         label: 'Moonshot AI',
@@ -585,9 +1030,13 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         </Text>
         <Select
           options={options}
-          onChange={value => {
+          onChange={(value: string) => {
             if (value === 'skip') {
               closeWithCancelled('Provider setup skipped')
+              return
+            }
+            if (value === 'codex-oauth') {
+              setScreen('codex-oauth')
               return
             }
             startCreateFromPreset(value as ProviderPreset)
@@ -599,7 +1048,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             }
             setScreen('menu')
           }}
-          visibleOptionCount={Math.min(12, options.length)}
+          visibleOptionCount={Math.min(13, options.length)}
         />
       </Box>
     )
@@ -676,6 +1125,15 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         description: 'Remove a provider profile',
         disabled: !hasSelectableProviders,
       },
+      ...(hasStoredCodexOAuthCredentials
+        ? [
+            {
+              value: 'logout-codex-oauth',
+              label: 'Log out Codex OAuth',
+              description: 'Clear securely stored Codex OAuth credentials',
+            },
+          ]
+        : []),
       {
         value: 'done',
         label: 'Done',
@@ -720,7 +1178,7 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         </Box>
         <Select
           options={options}
-          onChange={value => {
+          onChange={(value: string) => {
             setErrorMessage(undefined)
             switch (value) {
               case 'add':
@@ -741,6 +1199,47 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
                   setScreen('select-delete')
                 }
                 break
+              case 'logout-codex-oauth': {
+                const cleared = clearCodexCredentials()
+                if (!cleared.success) {
+                  setErrorMessage(
+                    cleared.warning ??
+                      'Could not clear Codex OAuth credentials.',
+                  )
+                  break
+                }
+
+                setHasStoredCodexOAuthCredentials(false)
+                setStoredCodexOAuthProfileId(undefined)
+                const codexProfile = findCodexOAuthProfile(
+                  getProviderProfiles(),
+                  storedCodexOAuthProfileId,
+                )
+                let settingsOverrideError: string | null = null
+                if (codexProfile) {
+                  const result = deleteProviderProfile(codexProfile.id)
+                  if (!result.removed) {
+                    setErrorMessage(
+                      'Codex OAuth credentials were cleared, but the Codex profile could not be removed.',
+                    )
+                    refreshProfiles()
+                    break
+                  }
+
+                  clearPersistedCodexOAuthProfile()
+                  settingsOverrideError = result.activeProfileId
+                    ? clearStartupProviderOverrideFromUserSettings()
+                    : null
+                }
+
+                refreshProfiles()
+                setStatusMessage(
+                  settingsOverrideError
+                    ? `Codex OAuth logged out. Warning: could not clear startup provider override (${settingsOverrideError}).`
+                    : 'Codex OAuth logged out.',
+                )
+                break
+              }
               default:
                 closeWithCancelled('Provider manager closed')
                 break
@@ -823,6 +1322,85 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
     case 'select-preset':
       content = renderPresetSelection()
       break
+    case 'select-ollama-model':
+      content = renderOllamaSelection()
+      break
+    case 'codex-oauth':
+      content = (
+        <CodexOAuthSetup
+          onBack={() => setScreen('select-preset')}
+          onConfigured={async (tokens, persistCredentials) => {
+            const payload: ProviderProfileInput = {
+              provider: 'openai',
+              name: CODEX_OAUTH_PROVIDER_NAME,
+              baseUrl: DEFAULT_CODEX_BASE_URL,
+              model: CODEX_OAUTH_PROVIDER_MODEL,
+              apiKey: '',
+            }
+
+            const existing = findCodexOAuthProfile(
+              getProviderProfiles(),
+              storedCodexOAuthProfileId,
+            )
+            const saved = existing
+              ? updateProviderProfile(existing.id, payload)
+              : addProviderProfile(payload, { makeActive: true })
+
+            if (!saved) {
+              setErrorMessage(
+                'Codex OAuth login finished, but the provider profile could not be saved.',
+              )
+              setScreen('menu')
+              return
+            }
+
+            const active =
+              existing && activeProfileId !== saved.id
+                ? setActiveProviderProfile(saved.id)
+                : saved
+            if (!active) {
+              setErrorMessage(
+                'Codex OAuth login finished, but the provider could not be set as the startup provider.',
+              )
+              setScreen('menu')
+              return
+            }
+
+            persistCredentials({ profileId: saved.id })
+            const settingsOverrideError =
+              clearStartupProviderOverrideFromUserSettings()
+            const activationWarning = await activateCodexOAuthSession(tokens)
+            setHasStoredCodexOAuthCredentials(true)
+            setStoredCodexOAuthProfileId(saved.id)
+            refreshProfiles()
+            const warnings = [
+              activationWarning,
+              settingsOverrideError
+                ? `could not clear startup provider override (${settingsOverrideError})`
+                : null,
+            ].filter((warning): warning is string => Boolean(warning))
+            const message = buildCodexOAuthActivationMessage({
+              prefix: 'Codex OAuth configured',
+              activationWarning,
+              warnings,
+            })
+
+            if (mode === 'first-run') {
+              onDone({
+                action: 'saved',
+                activeProfileId: active.id,
+                message,
+              })
+              return
+            }
+
+            setStatusMessage(message)
+            setErrorMessage(undefined)
+            setScreen('menu')
+          }}
+        />
+      )
+      break
     case 'form':
       content = renderForm()
       break
@@ -831,36 +1409,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         'Set active provider',
         'No providers available. Add one first.',
         profileId => {
-          if (profileId === GITHUB_PROVIDER_ID) {
-            const githubError = activateGithubProvider()
-            if (githubError) {
-              setErrorMessage(`Could not activate GitHub provider: ${githubError}`)
-              setScreen('menu')
-              return
-            }
-            refreshProfiles()
-            setStatusMessage(`Active provider: ${GITHUB_PROVIDER_LABEL}`)
-            setScreen('menu')
-            return
-          }
-
-          const active = setActiveProviderProfile(profileId)
-          if (!active) {
-            setErrorMessage('Could not change active provider.')
-            setScreen('menu')
-            return
-          }
-          const settingsOverrideError =
-            clearStartupProviderOverrideFromUserSettings()
-          refreshProfiles()
-          setStatusMessage(
-            settingsOverrideError
-              ? `Active provider: ${active.name}. Warning: could not clear startup provider override (${settingsOverrideError}).`
-              : `Active provider: ${active.name}`,
-          )
-          setScreen('menu')
+          void activateSelectedProvider(profileId)
         },
-          { includeGithub: true },
+        { includeGithub: true },
       )
       break
     case 'select-edit':
@@ -889,10 +1440,27 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
             return
           }
 
+          const deletedCodexOAuthProfile =
+            findCodexOAuthProfile(
+              profiles,
+              storedCodexOAuthProfileId,
+            )?.id === profileId
           const result = deleteProviderProfile(profileId)
           if (!result.removed) {
             setErrorMessage('Could not delete provider.')
           } else {
+            if (deletedCodexOAuthProfile) {
+              const cleared = clearCodexCredentials()
+              if (!cleared.success) {
+                setErrorMessage(
+                  cleared.warning ??
+                    'Provider deleted, but Codex OAuth credentials could not be cleared.',
+                )
+              } else {
+                setStoredCodexOAuthProfileId(undefined)
+              }
+              clearPersistedCodexOAuthProfile()
+            }
             const settingsOverrideError = result.activeProfileId
               ? clearStartupProviderOverrideFromUserSettings()
               : null
